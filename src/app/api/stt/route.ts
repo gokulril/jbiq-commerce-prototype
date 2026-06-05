@@ -53,8 +53,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   const baseMime = (audio.type || "audio/webm").split(";")[0].trim() || "audio/webm";
   const cleanAudio = new Blob([await audio.arrayBuffer()], { type: baseMime });
 
+  // iOS Safari records audio/mp4 (AAC), not WebM.
+  // Sarvam validates by filename extension, so we must match it to the actual MIME type.
+  const ext = baseMime === "audio/mp4" ? "mp4"
+             : baseMime === "audio/ogg" ? "ogg"
+             : "webm";
+
   const sarvamForm = new FormData();
-  sarvamForm.append("file", cleanAudio, "recording.webm");
+  sarvamForm.append("file", cleanAudio, `recording.${ext}`);
   sarvamForm.append("model", "saaras:v3");
   sarvamForm.append("mode", "transcribe");
 

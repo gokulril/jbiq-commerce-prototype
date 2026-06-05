@@ -186,7 +186,9 @@ const NUM =
 
 // UNIT: English + Hindi abbreviations/words
 const UNIT =
-  "(?:kgs?|kilos?|kilo|किलो|grams?|gms?|g|ग्राम|litres?|liters?|ltr|ml|l|लीटर" +
+  "(?:kilograms?|kgs?|kilos?|kilo|किलोग्राम|किलो" +   // kg variants (longest first)
+  "|milligrams?|grams?|gms?|ग्राम" +                   // gram variants
+  "|millilitres?|milliliters?|litres?|liters?|ltr|ml|l|लीटर" + // litre/ml variants
   "|pkts?|packets?|पैकेट|pcs?|pieces?|piece|पीस|नग|dozen|दर्जन|gucch|bundle)";
 
 function cap(s: string): string {
@@ -1071,66 +1073,176 @@ function SkeletonLoader({ label }: { label: string }) {
   );
 }
 
-/* ─── CapturePane ─────────────────────────────────────────────────────────── */
+/* ─── Web Speech API types (not always present in TS DOM lib) ────────────── */
 
-function CapturePane({ t, mode, text, setText, processing, onCapture, pictureMode, typeCta }: {
-  t: typeof EN; mode: Mode; text: string; setText: (s: string) => void;
-  processing: boolean; onCapture: (data?: Blob | File) => void; pictureMode: boolean;
-  /** Override the type-mode submit CTA label. Defaults to t.readList. */
+interface ISpeechRecognitionResult {
+  readonly isFinal: boolean;
+  readonly [index: number]: { transcript: string };
+}
+interface ISpeechRecognitionResultList {
+  readonly length: number;
+  item(index: number): ISpeechRecognitionResult;
+  readonly [index: number]: ISpeechRecognitionResult;
+}
+interface ISpeechRecognitionEvent extends Event {
+  readonly resultIndex: number;
+  readonly results: ISpeechRecognitionResultList;
+}
+interface ISpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((e: ISpeechRecognitionEvent) => void) | null;
+  onerror: ((e: Event) => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+}
+type SpeechRecognitionCtor = new () => ISpeechRecognition;
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as Record<string, unknown>;
+  return (w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null) as SpeechRecognitionCtor | null;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * CapturePane — voice / type / scan input.
+ *
+ * VOICE STRATEGY (fixes the "works on my phone, breaks for others" problem):
+ *   1. Web Speech API (primary) — built into every browser, free, no rate
+ *      limits, no API key, no server call. Works on Chrome Android + Safari
+ *      iOS 14.1+. Passes transcript string directly to onCapture().
+ *   2. Sarvam STT (fallback) — only used if Web Speech is unavailable.
+ *      Records via MediaRecorder and POSTs to /api/stt. Passes Blob to
+ *      onCapture(). Subject to Sarvam rate limits and Vercel 10s timeout.
+ *
+ * onCapture signature: (data?: Blob | File | string)
+ *   string  = Web Speech transcript (direct, no server)
+ *   Blob    = Sarvam audio (send to /api/stt)
+ *   File    = Scan image (send to /api/ocr)
+ *   undefined = no data / permission denied (use fallback sample)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+function CapturePane({ t, lang, mode, text, setText, processing, onCapture, pictureMode, typeCta }: {
+  t: typeof EN; lang: Lang; mode: Mode; text: string; setText: (s: string) => void;
+  processing: boolean;
+  onCapture: (data?: Blob | File | string) => void;
+  pictureMode: boolean;
   typeCta?: string;
 }) {
+  // ── Detect Web Speech API (Chrome Android, Safari iOS 14.1+) ──
+  const hasSR = React.useMemo(() => getSpeechRecognitionCtor() !== null, []);
+
+  // Web Speech state
+  const wsRef      = React.useRef<ISpeechRecognition | null>(null);
+  const wsAccumRef = React.useRef(""); // final words accumulated
+  const [wsDisplay, setWsDisplay] = React.useState(""); // live display incl. interim
+
+  // Sarvam / MediaRecorder state (fallback only)
   const recorderRef     = React.useRef<MediaRecorder | null>(null);
   const chunksRef       = React.useRef<Blob[]>([]);
   const cameraInputRef  = React.useRef<HTMLInputElement>(null);
   const galleryInputRef = React.useRef<HTMLInputElement>(null);
+
   const [micGranted, setMicGranted] = React.useState<boolean | null>(null);
   const [stopping,   setStopping]   = React.useState(false);
 
-  // Fix #5: recording starts ONLY when mode is "voice" (not on default type/scan open)
   React.useEffect(() => {
     if (mode !== "voice" || processing) return;
     setStopping(false);
-    let cancelled = false;
-    let localStream: MediaStream | null = null;
-    let localRec: MediaRecorder | null = null;
+    setWsDisplay("");
+    wsAccumRef.current = "";
 
-    navigator.mediaDevices.getUserMedia({ audio: true })
-      .then((stream) => {
-        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
-        localStream = stream;
-        const mimeType = ["audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus","audio/mp4"]
-          .find((t) => MediaRecorder.isTypeSupported(t)) ?? "";
-        localRec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-        chunksRef.current = [];
-        localRec.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-        localRec.start(200);
-        recorderRef.current = localRec;
+    if (hasSR) {
+      /* ── Web Speech API path ── */
+      const SR = getSpeechRecognitionCtor()!;
+      const rec = new SR();
+      rec.continuous = true;
+      rec.interimResults = true;
+      // en-IN handles both English and Hinglish; hi-IN handles Devanagari input
+      rec.lang = lang === "hi" ? "hi-IN" : "en-IN";
+
+      rec.onresult = (e: ISpeechRecognitionEvent) => {
+        let interim = "";
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          if (e.results[i].isFinal) {
+            wsAccumRef.current += e.results[i][0].transcript + " ";
+          } else {
+            interim = e.results[i][0].transcript;
+          }
+        }
+        setWsDisplay(wsAccumRef.current + interim);
+      };
+
+      rec.onerror = () => setMicGranted(false);
+
+      try {
+        rec.start();
+        wsRef.current = rec;
         setMicGranted(true);
-      })
-      .catch(() => { if (!cancelled) setMicGranted(false); });
+      } catch { setMicGranted(false); }
 
-    return () => {
-      cancelled = true;
-      if (localRec && localRec.state !== "inactive") localRec.stop();
-      localStream?.getTracks().forEach((t) => t.stop());
-      recorderRef.current = null;
-    };
+      return () => {
+        try { rec.abort(); } catch { /* ignore */ }
+        wsRef.current = null;
+      };
+
+    } else {
+      /* ── Sarvam fallback path (MediaRecorder) ── */
+      let cancelled = false;
+      let localStream: MediaStream | null = null;
+      let localRec: MediaRecorder | null = null;
+
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then((stream) => {
+          if (cancelled) { stream.getTracks().forEach((track) => track.stop()); return; }
+          localStream = stream;
+          const mimeType =
+            ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"]
+              .find((mt) => MediaRecorder.isTypeSupported(mt)) ?? "";
+          localRec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+          chunksRef.current = [];
+          localRec.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+          localRec.start(200);
+          recorderRef.current = localRec;
+          setMicGranted(true);
+        })
+        .catch(() => { if (!cancelled) setMicGranted(false); });
+
+      return () => {
+        cancelled = true;
+        if (localRec && localRec.state !== "inactive") localRec.stop();
+        localStream?.getTracks().forEach((track) => track.stop());
+        recorderRef.current = null;
+      };
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, processing]);
+  }, [mode, processing, hasSR, lang]);
 
   const handleDone = () => {
     setStopping(true);
-    const rec = recorderRef.current;
-    if (!rec || rec.state === "inactive" || chunksRef.current.length === 0) {
-      onCapture(undefined); setStopping(false); return;
+
+    if (hasSR && wsRef.current) {
+      /* Web Speech: stop, return transcript string */
+      const transcript = wsAccumRef.current.trim();
+      try { wsRef.current.stop(); } catch { /* ignore */ }
+      wsRef.current = null;
+      onCapture(transcript || undefined);
+      setStopping(false);
+    } else {
+      /* Sarvam: stop recorder, return audio Blob */
+      const rec = recorderRef.current;
+      if (!rec || rec.state === "inactive" || chunksRef.current.length === 0) {
+        onCapture(undefined); setStopping(false); return;
+      }
+      rec.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
+        rec.stream.getTracks().forEach((track) => track.stop());
+        recorderRef.current = null;
+        onCapture(blob); setStopping(false);
+      };
+      if (rec.state === "recording" || rec.state === "paused") rec.stop();
     }
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
-      rec.stream.getTracks().forEach((t) => t.stop());
-      recorderRef.current = null;
-      onCapture(blob); setStopping(false);
-    };
-    if (rec.state === "recording" || rec.state === "paused") rec.stop();
   };
 
   if (processing) return <SkeletonLoader label={mode === "scan" ? t.scanReading : t.reading} />;
@@ -1146,26 +1258,41 @@ function CapturePane({ t, mode, text, setText, processing, onCapture, pictureMod
         </div>
       );
     }
+
+    const isListening = micGranted === true && !stopping;
+
     return (
       <div className="flex flex-col gap-4">
-        <div className="flex min-h-36 flex-col items-center justify-center gap-3 rounded-xl bg-gray-100 py-6">
+        <div className="flex min-h-36 flex-col items-center justify-center gap-3 rounded-xl bg-gray-100 px-4 py-5">
           <span className={cn(
-            "flex h-14 w-14 items-center justify-center rounded-full bg-primary transition-shadow",
-            micGranted === true && !stopping && "shadow-[0_0_0_8px_rgba(53,53,243,0.18)]",
+            "flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-primary transition-shadow",
+            isListening && "shadow-[0_0_0_8px_rgba(53,53,243,0.18)]",
           )}>
-            <Mic size={24} className={cn("text-white", micGranted === true && !stopping && "animate-pulse")} />
+            <Mic size={24} className={cn("text-white", isListening && "animate-pulse")} />
           </span>
+
           <p className="text-body-s font-medium text-text-high">
             {stopping ? t.reading : t.listening}
           </p>
-          {micGranted === null && (
-            <p className="px-6 text-center text-body-xs font-medium text-text-disabled">
-              {t === HI ? "माइक की अनुमति का इंतज़ार…" : "Waiting for mic permission…"}
+
+          {/* Live transcript — user sees their speech as it's recognised */}
+          {isListening && wsDisplay && (
+            <p className="w-full rounded-lg bg-white px-3 py-2 text-center text-body-xs font-medium leading-relaxed text-text-high">
+              {wsDisplay}
             </p>
           )}
-          {micGranted === true && !stopping && (
-            <p className="px-6 text-center text-body-xs font-medium italic text-text-disabled">
-              {t === HI ? "स्वाभाविक रूप से बोलें — हिंदी और English समझी जाती है" : "Speak naturally — Sarvam understands Hindi and English"}
+
+          {isListening && !wsDisplay && micGranted !== null && (
+            <p className="text-center text-body-xs font-medium italic text-text-disabled">
+              {t === HI
+                ? "स्वाभाविक रूप से बोलें — हिंदी और English समझी जाती है"
+                : "Speak naturally — Hindi and English both understood"}
+            </p>
+          )}
+
+          {micGranted === null && (
+            <p className="text-center text-body-xs font-medium text-text-disabled">
+              {t === HI ? "माइक की अनुमति का इंतज़ार…" : "Waiting for mic permission…"}
             </p>
           )}
         </div>
@@ -1242,18 +1369,25 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
   const addAnother = () =>
     setDrafts((prev) => [...prev, { id: `d-${Date.now()}`, name: "", qty: "", include: true, focusOnMount: true }]);
 
-  const capture = async (data?: Blob | File) => {
+  const capture = async (data?: Blob | File | string) => {
     setProcessing(true);
     const voiceFallback = lang === "hi" ? VOICE_SAMPLE_HI : VOICE_SAMPLE;
 
     if (mode === "voice") {
-      if (data && data.size > 0) {
+      if (typeof data === "string") {
+        /* Web Speech API transcript — process directly, no server call */
+        const parsed = parseItems(data);
+        setDrafts(makeDrafts(parsed.length > 0 ? parsed : parseItems(voiceFallback)));
+      } else if (data instanceof Blob && data.size > 0) {
+        /* Sarvam fallback — send audio to server */
         try {
           const transcript = await sarvamSTT(data);
           const parsed = parseItems(transcript);
           setDrafts(makeDrafts(parsed.length > 0 ? parsed : parseItems(voiceFallback)));
         } catch { setDrafts(makeDrafts(parseItems(voiceFallback))); }
-      } else { setDrafts(makeDrafts(parseItems(voiceFallback))); }
+      } else {
+        setDrafts(makeDrafts(parseItems(voiceFallback)));
+      }
       setProcessing(false); setStage("confirm");
 
     } else if (mode === "scan") {
@@ -1282,7 +1416,7 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
         {stage === "capture" ? (
           <>
             <ModeChips t={t} mode={mode} setMode={setMode} scanLabel={t.modeScan} />
-            <CapturePane t={t} mode={mode} text={text} setText={setText}
+            <CapturePane t={t} lang={lang} mode={mode} text={text} setText={setText}
               processing={processing} onCapture={capture} pictureMode={false} />
           </>
         ) : (
@@ -1370,18 +1504,25 @@ function BuySheet({ t, lang, items, onClose, onConfirm }: {
     setTicked(init);
   };
 
-  const capture = async (data?: Blob | File) => {
+  const capture = async (data?: Blob | File | string) => {
     setProcessing(true);
     const voiceFallback = lang === "hi" ? VOICE_SAMPLE_HI : VOICE_SAMPLE;
 
     if (mode === "voice") {
-      if (data && data.size > 0) {
+      if (typeof data === "string") {
+        /* Web Speech transcript */
+        const parsed = parseItems(data);
+        applyMatch(parsed.length > 0 ? parsed.map((p) => p.name) : fallbackNames());
+      } else if (data instanceof Blob && data.size > 0) {
+        /* Sarvam fallback */
         try {
           const transcript = await sarvamSTT(data);
           const parsed = parseItems(transcript);
           applyMatch(parsed.length > 0 ? parsed.map((p) => p.name) : fallbackNames());
         } catch { applyMatch(fallbackNames()); }
-      } else { applyMatch(fallbackNames()); }
+      } else {
+        applyMatch(fallbackNames());
+      }
       setProcessing(false); setStage("reconcile");
 
     } else if (mode === "scan") {
@@ -1412,8 +1553,7 @@ function BuySheet({ t, lang, items, onClose, onConfirm }: {
         {stage === "capture" ? (
           <>
             <ModeChips t={t} mode={mode} setMode={setMode} scanLabel={t.modePicture} />
-            {/* Issue #1: type CTA = "Done"/"हो गया", not "Read my list" */}
-            <CapturePane t={t} mode={mode} text={text} setText={setText}
+            <CapturePane t={t} lang={lang} mode={mode} text={text} setText={setText}
               processing={processing} onCapture={capture} pictureMode
               typeCta={t.updateList} />
           </>
