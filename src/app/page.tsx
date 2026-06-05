@@ -29,10 +29,12 @@ import {
  *   • Type  → LIVE (local parser)
  *   • Speak → LIVE via Sarvam Saarika v3 (POST /api/stt).
  *             Falls back to VOICE_SAMPLE if SARVAM_API_KEY not set or API errors.
- *   • Scan  → SIMULATED (returns SCAN_SAMPLE — OCR TBD in Phase 2)
+ *   • Scan  → LIVE via Sarvam Document Intelligence / Sarvam Vision
+ *             (POST /api/ocr — 5-step async job, ~10-25 s).
+ *             Falls back to SCAN_SAMPLE on error.
  *
- * The recognize() function handles type/scan fallback.
- * The async captureVoice() helper in AddSheet/BuySheet handles the live STT path.
+ * recognize() handles type-only fallback now.
+ * sarvamSTT() / sarvamOCR() are the live API helpers.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /* ─── i18n ─────────────────────────────────────────────────────────────────── */
@@ -63,9 +65,10 @@ const EN = {
   reading: "Reading your list…",
   typePlaceholder: "e.g. milk, 2 kg rice, salt",
   readList: "Read my list",
-  scanPrompt: "Upload a photo of your written list",
-  scanCta: "Choose photo",
-  pictureNote: "Picture = your list or bill (not the items)",
+  scanPrompt: "Tap to take a photo of your list or bill",
+  scanCta: "Take photo",
+  scanReading: "Scanning your list… this takes 10–20 seconds",
+  pictureNote: "Photo of your list or bill — not the items themselves",
   confirmTitle: "We heard these — confirm",
   confirmHint: "Edit names or quantities, untick to skip",
   addAnother: "Add another",
@@ -140,15 +143,13 @@ function parseItems(raw: string): { name: string; qty: string }[] {
     .filter((i) => i.name.length > 0);
 }
 
-/* ─── Recognition seam — type/scan fallback only (voice now uses Sarvam) ─── */
+/* ─── Fallback samples (used when live APIs are unavailable) ─────────────── */
 
-// TODO(phase-2): mode === "scan" → POST image to the chosen OCR endpoint.
 const VOICE_SAMPLE = "milk, three kilo rice, one packet salt";
 const SCAN_SAMPLE  = "Aashirvaad Atta 5 kg\nOnion 1 kg\nTata Salt 1 pkt\nAmul Milk 1 l";
 
-function recognize(mode: Exclude<Mode, "voice">, typed: string): { name: string; qty: string }[] {
-  if (mode === "type") return parseItems(typed);
-  return parseItems(SCAN_SAMPLE);
+function recognize(typed: string): { name: string; qty: string }[] {
+  return parseItems(typed);
 }
 
 function norm(s: string): string {
@@ -172,20 +173,12 @@ function matchBought(boughtNames: string[], items: Item[]): Set<string> {
   return matched;
 }
 
-/* ─── Sarvam STT helper ───────────────────────────────────────────────────── */
+/* ─── Sarvam API helpers ──────────────────────────────────────────────────── */
 
-/**
- * POST the recorded Blob to our server-side proxy at /api/stt.
- * Returns the transcript string, or throws on error.
- *
- * basePath is hardcoded to /commerce (matches next.config.ts).
- * The API route works in `npm run dev:commerce` but is excluded from
- * `next build` (static export). See src/app/api/stt/route.ts.
- */
+/** POST audio blob → /api/stt → transcript string */
 async function sarvamSTT(blob: Blob): Promise<string> {
   const form = new FormData();
   form.append("audio", blob, "recording.webm");
-
   const res = await fetch("/api/stt", { method: "POST", body: form });
   if (!res.ok) {
     const { error } = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error?: string };
@@ -193,6 +186,23 @@ async function sarvamSTT(blob: Blob): Promise<string> {
   }
   const { transcript } = await res.json() as { transcript?: string };
   return transcript ?? "";
+}
+
+/**
+ * POST image file → /api/ocr → extracted text.
+ * Sarvam Document Intelligence job (~10-25 s for a single-page photo).
+ * Falls back to SCAN_SAMPLE in the caller if this throws.
+ */
+async function sarvamOCR(file: File): Promise<string> {
+  const form = new FormData();
+  form.append("image", file, file.name || "photo.jpg");
+  const res = await fetch("/api/ocr", { method: "POST", body: form });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error?: string };
+    throw new Error(error ?? `HTTP ${res.status}`);
+  }
+  const { text } = await res.json() as { text?: string };
+  return text ?? "";
 }
 
 /* ─── Root ────────────────────────────────────────────────────────────────── */
@@ -614,11 +624,13 @@ function CapturePane({
   text: string;
   setText: (s: string) => void;
   processing: boolean;
-  onCapture: (blob?: Blob) => void;
+  /** Voice: called with audio Blob. Scan: called with image File. Type: called with no arg. */
+  onCapture: (data?: Blob | File) => void;
   pictureMode: boolean;
 }) {
-  const recorderRef = React.useRef<MediaRecorder | null>(null);
-  const chunksRef   = React.useRef<Blob[]>([]);
+  const recorderRef  = React.useRef<MediaRecorder | null>(null);
+  const chunksRef    = React.useRef<Blob[]>([]);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
   const [micGranted, setMicGranted] = React.useState<boolean | null>(null);
   const [stopping,   setStopping]   = React.useState(false);
 
@@ -682,7 +694,9 @@ function CapturePane({
     if (rec.state === "recording" || rec.state === "paused") rec.stop();
   };
 
-  if (processing) return <SkeletonLoader label={t.reading} />;
+  if (processing) {
+    return <SkeletonLoader label={mode === "scan" ? t.scanReading : t.reading} />;
+  }
 
   /* ── Voice mode ── */
   if (mode === "voice") {
@@ -729,19 +743,36 @@ function CapturePane({
     );
   }
 
-  /* ── Scan mode ── */
+  /* ── Scan mode — real camera / file picker ── */
   if (mode === "scan") {
+    const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) onCapture(file);
+      e.target.value = ""; // reset so same file can be re-selected
+    };
     return (
       <div className="flex flex-col gap-3">
-        <div className="flex min-h-36 flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 bg-gray-100">
+        {/* Hidden file input — opens camera on mobile, file picker on desktop */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          className="hidden"
+          onChange={handleFileChange}
+        />
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="flex min-h-36 flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 bg-gray-100"
+        >
           <Camera size={28} className="text-text-disabled" />
           <p className="px-6 text-center text-body-xs font-medium text-text-disabled">{t.scanPrompt}</p>
-        </div>
+        </button>
         {pictureMode && (
           <p className="text-center text-body-xs font-medium text-text-disabled">{t.pictureNote}</p>
         )}
-        <PillButton primary full onClick={() => onCapture()}>
-          <ImageIcon size={16} />{t.scanCta}
+        <PillButton primary full onClick={() => fileInputRef.current?.click()}>
+          <Camera size={16} />{t.scanCta}
         </PillButton>
       </div>
     );
@@ -787,33 +818,50 @@ function AddSheet({
   const makeDrafts = (parsed: { name: string; qty: string }[]) =>
     parsed.map((p, i) => ({ id: `d-${Date.now()}-${i}`, name: p.name, qty: p.qty, include: true }));
 
-  const capture = async (audioBlob?: Blob) => {
+  const capture = async (data?: Blob | File) => {
     setProcessing(true);
 
     if (mode === "voice") {
-      if (audioBlob && audioBlob.size > 0) {
-        // ── Live Sarvam STT ──
+      // ── Live Sarvam STT ──
+      if (data && data.size > 0) {
         try {
-          const transcript = await sarvamSTT(audioBlob);
+          const transcript = await sarvamSTT(data);
           const parsed = parseItems(transcript);
           setDrafts(makeDrafts(parsed.length > 0 ? parsed : parseItems(VOICE_SAMPLE)));
         } catch (err) {
-          console.error("[AddSheet] Sarvam STT failed, using sample:", err);
+          console.error("[AddSheet] STT failed, using sample:", err);
           setDrafts(makeDrafts(parseItems(VOICE_SAMPLE)));
         }
       } else {
-        // ── No blob (mic denied or empty) — silent fallback ──
         setDrafts(makeDrafts(parseItems(VOICE_SAMPLE)));
       }
       setProcessing(false);
       setStage("confirm");
+
+    } else if (mode === "scan") {
+      // ── Live Sarvam OCR ──
+      if (data instanceof File && data.size > 0) {
+        try {
+          const extracted = await sarvamOCR(data);
+          const parsed = parseItems(extracted);
+          setDrafts(makeDrafts(parsed.length > 0 ? parsed : parseItems(SCAN_SAMPLE)));
+        } catch (err) {
+          console.error("[AddSheet] OCR failed, using sample:", err);
+          setDrafts(makeDrafts(parseItems(SCAN_SAMPLE)));
+        }
+      } else {
+        setDrafts(makeDrafts(parseItems(SCAN_SAMPLE)));
+      }
+      setProcessing(false);
+      setStage("confirm");
+
     } else {
-      // ── Type / Scan ──
+      // ── Type ──
       window.setTimeout(() => {
-        setDrafts(makeDrafts(recognize(mode, text)));
+        setDrafts(makeDrafts(recognize(text)));
         setProcessing(false);
         setStage("confirm");
-      }, mode === "type" ? 250 : 1100);
+      }, 250);
     }
   };
 
@@ -892,6 +940,9 @@ function BuySheet({
   const [ticked,     setTicked]     = React.useState<Record<string, boolean>>({});
   const [recognized, setRecognized] = React.useState<string[]>([]);
 
+  const fallbackNames = () =>
+    items.slice(0, Math.max(1, items.length - 1)).map((it) => it.name);
+
   const applyMatch = (names: string[]) => {
     const matched = matchBought(names, items);
     const init: Record<string, boolean> = {};
@@ -900,38 +951,50 @@ function BuySheet({
     setTicked(init);
   };
 
-  const capture = async (audioBlob?: Blob) => {
+  const capture = async (data?: Blob | File) => {
     setProcessing(true);
 
     if (mode === "voice") {
-      if (audioBlob && audioBlob.size > 0) {
-        // ── Live Sarvam STT ──
+      // ── Live Sarvam STT ──
+      if (data && data.size > 0) {
         try {
-          const transcript = await sarvamSTT(audioBlob);
+          const transcript = await sarvamSTT(data);
           const parsed = parseItems(transcript);
-          const names = parsed.length > 0
-            ? parsed.map((p) => p.name)
-            : items.slice(0, Math.max(1, items.length - 1)).map((it) => it.name);
-          applyMatch(names);
+          applyMatch(parsed.length > 0 ? parsed.map((p) => p.name) : fallbackNames());
         } catch (err) {
-          console.error("[BuySheet] Sarvam STT failed, using fallback:", err);
-          applyMatch(items.slice(0, Math.max(1, items.length - 1)).map((it) => it.name));
+          console.error("[BuySheet] STT failed, using fallback:", err);
+          applyMatch(fallbackNames());
         }
       } else {
-        // ── Fallback ──
-        applyMatch(items.slice(0, Math.max(1, items.length - 1)).map((it) => it.name));
+        applyMatch(fallbackNames());
       }
       setProcessing(false);
       setStage("reconcile");
+
+    } else if (mode === "scan") {
+      // ── Live Sarvam OCR ──
+      if (data instanceof File && data.size > 0) {
+        try {
+          const extracted = await sarvamOCR(data);
+          const parsed = parseItems(extracted);
+          applyMatch(parsed.length > 0 ? parsed.map((p) => p.name) : fallbackNames());
+        } catch (err) {
+          console.error("[BuySheet] OCR failed, using fallback:", err);
+          applyMatch(fallbackNames());
+        }
+      } else {
+        applyMatch(fallbackNames());
+      }
+      setProcessing(false);
+      setStage("reconcile");
+
     } else {
+      // ── Type ──
       window.setTimeout(() => {
-        const names = mode === "type"
-          ? recognize("type", text).map((p) => p.name)
-          : items.slice(0, Math.max(1, items.length - 1)).map((it) => it.name);
-        applyMatch(names);
+        applyMatch(recognize(text).map((p) => p.name));
         setProcessing(false);
         setStage("reconcile");
-      }, mode === "type" ? 250 : 1100);
+      }, 250);
     }
   };
 
