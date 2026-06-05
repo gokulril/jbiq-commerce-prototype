@@ -32,9 +32,6 @@ import {
  *   • Scan  → LIVE via Sarvam Document Intelligence / Sarvam Vision
  *             (POST /api/ocr — 5-step async job, ~10-25 s).
  *             Falls back to SCAN_SAMPLE on error.
- *
- * recognize() handles type-only fallback now.
- * sarvamSTT() / sarvamOCR() are the live API helpers.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /* ─── i18n ─────────────────────────────────────────────────────────────────── */
@@ -61,24 +58,23 @@ const EN = {
   modeScan: "Scan",
   modePicture: "Picture",
   listening: "Listening…",
-  stopRead: "Stop & read",
+  stopRead: "Done",
   reading: "Reading your list…",
   typePlaceholder: "e.g. milk, 2 kg rice, salt",
   readList: "Read my list",
-  scanPrompt: "Tap to take a photo of your list or bill",
+  scanPrompt: "Photo of your list or bill — not the items themselves",
   scanCta: "Take photo",
+  scanGallery: "Upload from gallery",
   scanReading: "Scanning your list… this takes 10–20 seconds",
-  pictureNote: "Photo of your list or bill — not the items themselves",
   confirmTitle: "We heard these — confirm",
-  confirmHint: "Edit names or quantities, untick to skip",
+  confirmHint: "Edit or untick to skip",
   addAnother: "Add another",
-  qtyPlaceholder: "qty",
-  itemPlaceholder: "Item name",
+  itemPlaceholder: "e.g. potato 2 kg",
   reconcileTitle: "We matched these as bought",
-  reconcileHint: "Tap to tick or untick, then update",
+  reconcileHint: "Tap to tick or untick, then tap Done",
   recognizedLabel: "From what you shared:",
   notMatched: "not on your list",
-  updateList: "Update list",
+  updateList: "Done",
   sampleNote: "Sample data — not from your activity",
   historyFooter:
     "Every bill or photo would be recorded here — your spending ledger builds from this.",
@@ -94,7 +90,7 @@ const HI: Partial<Strings> = {};
 type Lang = "en" | "hi";
 type Mode = "voice" | "type" | "scan";
 type Item = { id: string; name: string; qty: string; bought: boolean };
-type Draft = { id: string; name: string; qty: string; include: boolean };
+type Draft = { id: string; name: string; qty: string; include: boolean; focusOnMount?: boolean };
 type HistEntry = { id: string; store: string; icon: string; date: string; amount: string; items: string };
 
 /* ─── Sample data ─────────────────────────────────────────────────────────── */
@@ -115,6 +111,48 @@ const UNIT =
 function cap(s: string): string {
   s = s.trim();
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+/**
+ * Pre-process Sarvam Markdown output before item parsing.
+ * Handles: table rows, numbered lists, heading markers, bold/italic, bullets.
+ */
+function cleanMarkdown(raw: string): string {
+  return raw
+    .split("\n")
+    .map((line) => {
+      // Skip pure separator lines (e.g. "| --- | --- |" or "---")
+      const stripped = line.replace(/[\s|:*_-]/g, "");
+      if (!stripped) return "";
+
+      // Strip heading markers (# ## ###)
+      line = line.replace(/^#+\s*/, "");
+
+      // Handle table rows: extract text from pipe-delimited cells
+      // e.g. "| आटा | 5 kg |" → "आटा 5 kg"
+      if (line.includes("|")) {
+        const cells = line
+          .split("|")
+          .map((c) => c.trim())
+          .filter((c) => c && !/^[-:\s]+$/.test(c));
+        if (cells.length > 0) {
+          line = cells.join(" ");
+        }
+      }
+
+      // Strip numbered list markers: "1. " "2) " "१. " etc.
+      line = line.replace(/^\s*[\d१२३४५६७८९०]+[.)]\s+/, "");
+
+      // Strip bold/italic Markdown: **text** → text, *text* → text
+      line = line.replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1");
+
+      // Strip leading bullets/dashes (parseItems also does this)
+      line = line.replace(/^\s*[-•*]\s*/, "");
+
+      return line.trim();
+    })
+    .filter(Boolean)
+    .join("\n");
 }
 
 function parseItems(raw: string): { name: string; qty: string }[] {
@@ -156,15 +194,76 @@ function norm(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9ऀ-ॿ ]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+/* ─── Cross-language synonym dictionary ───────────────────────────────────── */
+
+/**
+ * Maps canonical English grocery terms to their Hindi and Hinglish equivalents.
+ * Used by matchBought so that "चावल" correctly matches "Rice" and vice versa.
+ */
+const SYNONYMS: Record<string, string[]> = {
+  rice:    ["चावल", "chawal", "chaawal", "bhaat", "bhath", "javal", "chawl"],
+  milk:    ["दूध", "doodh", "dudh", "doodha"],
+  salt:    ["नमक", "namak", "loon", "nun"],
+  atta:    ["आटा", "flour", "wheat flour", "gehu", "gehun", "maida", "मैदा", "गेहूं"],
+  onion:   ["प्याज", "pyaaz", "pyaz", "kanda", "pyaja"],
+  potato:  ["आलू", "aloo", "aalu", "batata", "aaloo"],
+  tomato:  ["टमाटर", "tamatar", "tamaatar"],
+  sugar:   ["चीनी", "cheeni", "shakkar", "chini"],
+  dal:     ["दाल", "lentil", "lentils", "arhar", "moong", "masoor", "chana", "daal"],
+  oil:     ["तेल", "tel", "cooking oil", "sarson", "refined oil"],
+  bread:   ["ब्रेड", "pav", "pau", "double roti", "bread"],
+  egg:     ["अंडा", "anda", "eggs", "अंडे", "ande"],
+  ghee:    ["घी", "ghi", "clarified butter"],
+  tea:     ["चाय", "chai"],
+  coffee:  ["कॉफी", "kaafi", "coffee"],
+  soap:    ["साबुन", "sabun"],
+  shampoo: ["शैम्पू", "shampu"],
+  paneer:  ["पनीर", "cottage cheese"],
+  curd:    ["दही", "dahi", "yogurt", "yoghurt", "dahee"],
+  butter:  ["मक्खन", "makhan"],
+  biscuit: ["बिस्कुट", "biskut", "cookie"],
+  chips:   ["चिप्स", "snacks"],
+  water:   ["पानी", "paani"],
+};
+
+/** Return the full synonym group (all variants) for a given name string. */
+function getSynonymGroup(name: string): Set<string> {
+  const n = norm(name);
+  const group = new Set<string>([n]);
+
+  for (const [eng, synonyms] of Object.entries(SYNONYMS)) {
+    const engN = norm(eng);
+    if (engN === n || synonyms.some((s) => norm(s) === n)) {
+      group.add(engN);
+      synonyms.forEach((s) => group.add(norm(s)));
+    }
+  }
+  return group;
+}
+
 function matchBought(boughtNames: string[], items: Item[]): Set<string> {
   const matched = new Set<string>();
   const bn = boughtNames.map(norm).filter(Boolean);
   for (const it of items) {
     const itn = norm(it.name);
+    const itSynonyms = getSynonymGroup(it.name);
     const itTokens = itn.split(" ").filter((tk) => tk.length > 2);
     for (const b of bn) {
-      const bTokens = b.split(" ");
-      if (itn.includes(b) || b.includes(itn) || itTokens.some((tk) => bTokens.includes(tk))) {
+      const bSynonyms = getSynonymGroup(b);
+
+      // Direct substring / token match
+      if (
+        itn.includes(b) ||
+        b.includes(itn) ||
+        itTokens.some((tk) => b.split(" ").includes(tk))
+      ) {
+        matched.add(it.id);
+        break;
+      }
+
+      // Synonym overlap match
+      const hasOverlap = [...itSynonyms].some((s) => bSynonyms.has(s));
+      if (hasOverlap) {
         matched.add(it.id);
         break;
       }
@@ -292,7 +391,7 @@ export default function HouseholdHub() {
   );
 }
 
-/* ─── Chip ────────────────────────────────────────────────────────────────── */
+/* ─── Chip (tabs / lang toggle only) ─────────────────────────────────────── */
 
 function Chip({
   active, onClick, children, className,
@@ -305,6 +404,32 @@ function Chip({
       className={cn(
         "rounded-full border px-3 py-1 text-label-s font-bold transition-colors",
         active ? "border-gray-900 bg-gray-900 text-gray-100" : "border-gray-300 bg-gray-200 text-gray-900",
+        className,
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+/* ─── ModeTab (input mode selector inside sheets) ─────────────────────────
+ * Selected state uses primary brand colour instead of gray-900
+ * so it reads as "active/chosen" not "darkened/disabled."
+ * ────────────────────────────────────────────────────────────────────────── */
+
+function ModeTab({
+  active, onClick, children, className,
+}: {
+  active?: boolean; onClick?: () => void; children: React.ReactNode; className?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "flex flex-1 items-center justify-center gap-1.5 rounded-full border py-2.5 text-label-l font-bold transition-colors",
+        active
+          ? "border-primary bg-primary text-white"
+          : "border-gray-300 bg-gray-100 text-gray-700",
         className,
       )}
     >
@@ -384,6 +509,8 @@ function StartScreen({
       </div>
 
       <div className="pb-safe shrink-0 px-4 pb-4 pt-3">
+        {/* Fix 1: Mode entry chips use bg-gray-900/text-white so they read as solid,
+            tappable action buttons — not the muted gray that looked disabled. */}
         <div className="mb-3 flex gap-2">
           <ModeEntryChip icon={<Mic      size={14} />} label={t.modeSpeak} onClick={() => onCreate("voice")} />
           <ModeEntryChip icon={<Keyboard size={14} />} label={t.modeType}  onClick={() => onCreate("type")}  />
@@ -409,11 +536,13 @@ function BenefitTile({ iconBg, icon, label }: { iconBg: string; icon: React.Reac
   );
 }
 
+/* Fix 1: Dark filled chips on the start screen so they clearly read as
+   "tap me" buttons rather than greyed-out/disabled UI. */
 function ModeEntryChip({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick: () => void }) {
   return (
     <button
       onClick={onClick}
-      className="flex flex-1 items-center justify-center gap-1.5 rounded-full border border-gray-300 bg-gray-200 py-2.5 text-label-l font-bold text-gray-900 transition-colors active:border-gray-900 active:bg-gray-900 active:text-gray-100"
+      className="flex flex-1 items-center justify-center gap-1.5 rounded-full bg-gray-900 py-2.5 text-label-l font-bold text-white transition-colors active:bg-gray-700"
     >
       {icon}
       {label}
@@ -565,7 +694,9 @@ function Sheet({ title, onClose, children }: { title: string; onClose: () => voi
   );
 }
 
-/* ─── Mode chips (inside sheets) ─────────────────────────────────────────── */
+/* ─── Mode chips (inside sheets) — Fix 2 ─────────────────────────────────
+ * Uses ModeTab instead of Chip: selected = brand primary (not gray-900/black).
+ * ────────────────────────────────────────────────────────────────────────── */
 
 function ModeChips({ t, mode, setMode, scanLabel }: {
   t: Strings; mode: Mode; setMode: (m: Mode) => void; scanLabel: string;
@@ -578,10 +709,9 @@ function ModeChips({ t, mode, setMode, scanLabel }: {
   return (
     <div className="flex shrink-0 gap-2">
       {chips.map(({ id, Icon, label }) => (
-        <Chip key={id} active={mode === id} onClick={() => setMode(id)}
-          className="flex flex-1 items-center justify-center gap-1.5 py-2.5 text-label-l">
+        <ModeTab key={id} active={mode === id} onClick={() => setMode(id)}>
           <Icon size={14} />{label}
-        </Chip>
+        </ModeTab>
       ))}
     </div>
   );
@@ -605,7 +735,7 @@ function SkeletonLoader({ label }: { label: string }) {
  *
  * VOICE — MediaRecorder lifecycle:
  *   • Starts recording (getUserMedia) when mode === "voice" and not processing.
- *   • User taps "Stop & read":
+ *   • User taps "Done":
  *       1. Sets local `stopping` state (button disabled, label changes).
  *       2. Stops the MediaRecorder; `onstop` fires when the final chunk is flushed.
  *       3. Assembles chunks into a Blob and calls onCapture(blob).
@@ -613,7 +743,11 @@ function SkeletonLoader({ label }: { label: string }) {
  *   • If mic is denied: shows a message, falls back gracefully.
  *   • Cleanup: stops stream tracks when mode changes or component unmounts.
  *
- * TYPE / SCAN — unchanged; onCapture() called with no blob.
+ * SCAN — Fix 7: Two separate buttons:
+ *   • "Take photo"         → input with capture="environment" (opens rear camera)
+ *   • "Upload from gallery" → input without capture attr (opens file picker / gallery)
+ *
+ * TYPE — unchanged; onCapture() called with no blob.
  * ────────────────────────────────────────────────────────────────────────── */
 
 function CapturePane({
@@ -628,9 +762,10 @@ function CapturePane({
   onCapture: (data?: Blob | File) => void;
   pictureMode: boolean;
 }) {
-  const recorderRef  = React.useRef<MediaRecorder | null>(null);
-  const chunksRef    = React.useRef<Blob[]>([]);
-  const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const recorderRef    = React.useRef<MediaRecorder | null>(null);
+  const chunksRef      = React.useRef<Blob[]>([]);
+  const cameraInputRef = React.useRef<HTMLInputElement>(null);
+  const galleryInputRef = React.useRef<HTMLInputElement>(null);
   const [micGranted, setMicGranted] = React.useState<boolean | null>(null);
   const [stopping,   setStopping]   = React.useState(false);
 
@@ -671,13 +806,12 @@ function CapturePane({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, processing]);
 
-  /* "Stop & read" handler */
-  const handleStopAndRead = () => {
+  /* Fix 6: "Done" handler (was "Stop & read") */
+  const handleDone = () => {
     setStopping(true);
     const rec = recorderRef.current;
 
     if (!rec || rec.state === "inactive" || chunksRef.current.length === 0) {
-      // No real recording available — parent will use VOICE_SAMPLE fallback
       onCapture(undefined);
       setStopping(false);
       return;
@@ -700,7 +834,6 @@ function CapturePane({
 
   /* ── Voice mode ── */
   if (mode === "voice") {
-    // Mic denied
     if (micGranted === false) {
       return (
         <div className="flex flex-col gap-4">
@@ -715,7 +848,6 @@ function CapturePane({
     return (
       <div className="flex flex-col gap-4">
         <div className="flex min-h-36 flex-col items-center justify-center gap-3 rounded-xl bg-gray-100 py-6">
-          {/* Pulsing ring indicates active recording */}
           <span className={cn(
             "flex h-14 w-14 items-center justify-center rounded-full bg-primary transition-shadow",
             micGranted === true && !stopping && "shadow-[0_0_0_8px_rgba(180,130,90,0.2)]",
@@ -736,44 +868,59 @@ function CapturePane({
             </p>
           )}
         </div>
-        <PillButton primary full disabled={stopping} onClick={handleStopAndRead}>
+        {/* Fix 6: CTA renamed from "Stop & read" → "Done" */}
+        <PillButton primary full disabled={stopping} onClick={handleDone}>
           {stopping ? "Reading…" : t.stopRead}
         </PillButton>
       </div>
     );
   }
 
-  /* ── Scan mode — real camera / file picker ── */
+  /* ── Scan mode — Fix 7: two separate options (camera + gallery) ── */
   if (mode === "scan") {
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (file) onCapture(file);
-      e.target.value = ""; // reset so same file can be re-selected
+      e.target.value = "";
     };
     return (
       <div className="flex flex-col gap-3">
-        {/* Hidden file input — opens camera on mobile, file picker on desktop */}
+        {/* Camera input — forces rear camera on mobile */}
         <input
-          ref={fileInputRef}
+          ref={cameraInputRef}
           type="file"
           accept="image/*"
           capture="environment"
           className="hidden"
           onChange={handleFileChange}
         />
+        {/* Gallery input — opens file picker / photo library */}
+        <input
+          ref={galleryInputRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={handleFileChange}
+        />
+
+        {/* Visual tap target */}
         <button
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() => cameraInputRef.current?.click()}
           className="flex min-h-36 flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 bg-gray-100"
         >
           <Camera size={28} className="text-text-disabled" />
           <p className="px-6 text-center text-body-xs font-medium text-text-disabled">{t.scanPrompt}</p>
         </button>
-        {pictureMode && (
-          <p className="text-center text-body-xs font-medium text-text-disabled">{t.pictureNote}</p>
-        )}
-        <PillButton primary full onClick={() => fileInputRef.current?.click()}>
-          <Camera size={16} />{t.scanCta}
-        </PillButton>
+
+        {/* Two action buttons */}
+        <div className="flex gap-2">
+          <PillButton primary full onClick={() => cameraInputRef.current?.click()}>
+            <Camera size={16} />{t.scanCta}
+          </PillButton>
+          <PillButton full onClick={() => galleryInputRef.current?.click()}>
+            <ImageIcon size={16} />{t.scanGallery}
+          </PillButton>
+        </div>
       </div>
     );
   }
@@ -786,6 +933,7 @@ function CapturePane({
         onChange={(e) => setText(e.target.value)}
         placeholder={t.typePlaceholder}
         rows={4}
+        autoFocus
         className="min-h-28 w-full resize-none rounded-xl bg-gray-100 px-4 py-3 text-body-m font-medium text-text-high placeholder:text-text-disabled outline-none focus:ring-2 focus:ring-primary"
       />
       <PillButton primary full disabled={!text.trim()} onClick={() => onCapture()}>
@@ -798,10 +946,10 @@ function CapturePane({
 /* ──────────────────────────────────────────────────────────────────────────
  * AddSheet — capture → confirm → add to list.
  *
- * capture(blob?) is async:
- *   • Voice + real blob → POST to /api/stt (Sarvam).
- *   • Voice + no blob (mic denied / empty) → VOICE_SAMPLE fallback.
- *   • Type / Scan → local recognize() as before.
+ * Fix 3:
+ *   • Confirm stage shows ONE combined input per draft ("Potato 2 kgs").
+ *   • onChange runs parseItems on the typed string to split name+qty.
+ *   • "Add another" auto-focuses the new input via focusOnMount flag.
  * ────────────────────────────────────────────────────────────────────────── */
 
 function AddSheet({
@@ -818,11 +966,37 @@ function AddSheet({
   const makeDrafts = (parsed: { name: string; qty: string }[]) =>
     parsed.map((p, i) => ({ id: `d-${Date.now()}-${i}`, name: p.name, qty: p.qty, include: true }));
 
+  /** Update one or more fields on a draft in a single setState call. */
+  const patchDraft = (id: string, updates: Partial<Omit<Draft, "id">>) =>
+    setDrafts((prev) => prev.map((d) => (d.id === id ? { ...d, ...updates } : d)));
+
+  const toggle = (id: string) =>
+    setDrafts((prev) => prev.map((d) => (d.id === id ? { ...d, include: !d.include } : d)));
+
+  /** Add another item row and auto-focus it. */
+  const addAnother = () =>
+    setDrafts((prev) => [
+      ...prev,
+      { id: `d-${Date.now()}`, name: "", qty: "", include: true, focusOnMount: true },
+    ]);
+
+  /**
+   * Handle changes to the combined "Potato 2 kgs" single input.
+   * Runs parseItems to split into name+qty; falls back to raw string if unparseable.
+   */
+  const handleCombinedChange = (id: string, value: string) => {
+    const parsed = parseItems(value);
+    if (parsed.length === 1 && parsed[0].name) {
+      patchDraft(id, { name: parsed[0].name, qty: parsed[0].qty });
+    } else {
+      patchDraft(id, { name: value, qty: "" });
+    }
+  };
+
   const capture = async (data?: Blob | File) => {
     setProcessing(true);
 
     if (mode === "voice") {
-      // ── Live Sarvam STT ──
       if (data && data.size > 0) {
         try {
           const transcript = await sarvamSTT(data);
@@ -839,11 +1013,12 @@ function AddSheet({
       setStage("confirm");
 
     } else if (mode === "scan") {
-      // ── Live Sarvam OCR ──
       if (data instanceof File && data.size > 0) {
         try {
-          const extracted = await sarvamOCR(data);
-          const parsed = parseItems(extracted);
+          const raw = await sarvamOCR(data);
+          // Fix 5: clean Markdown before parsing so all items survive
+          const cleaned = cleanMarkdown(raw);
+          const parsed = parseItems(cleaned);
           setDrafts(makeDrafts(parsed.length > 0 ? parsed : parseItems(SCAN_SAMPLE)));
         } catch (err) {
           console.error("[AddSheet] OCR failed, using sample:", err);
@@ -856,7 +1031,6 @@ function AddSheet({
       setStage("confirm");
 
     } else {
-      // ── Type ──
       window.setTimeout(() => {
         setDrafts(makeDrafts(recognize(text)));
         setProcessing(false);
@@ -864,13 +1038,6 @@ function AddSheet({
       }, 250);
     }
   };
-
-  const patch = (id: string, key: "name" | "qty", value: string) =>
-    setDrafts((prev) => prev.map((d) => (d.id === id ? { ...d, [key]: value } : d)));
-  const toggle = (id: string) =>
-    setDrafts((prev) => prev.map((d) => (d.id === id ? { ...d, include: !d.include } : d)));
-  const addAnother = () =>
-    setDrafts((prev) => [...prev, { id: `d-${Date.now()}`, name: "", qty: "", include: true }]);
 
   const count = drafts.filter((d) => d.include && d.name.trim()).length;
 
@@ -889,30 +1056,44 @@ function AddSheet({
               <p className="text-title-s font-bold text-text-high">{t.confirmTitle}</p>
               <p className="mt-0.5 text-body-xs font-medium text-text-disabled">{t.confirmHint}</p>
             </div>
+
             <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
-              {drafts.map((d) => (
-                <div key={d.id} className="flex items-center gap-3 rounded-xl bg-gray-100 px-3 py-3">
-                  <button onClick={() => toggle(d.id)}
-                    aria-label={d.include ? "Included" : "Skipped"}
-                    className={cn(
-                      "flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition-colors",
-                      d.include ? "border-primary bg-primary" : "border-gray-200",
-                    )}>
-                    {d.include && <Check size={11} className="text-white" />}
-                  </button>
-                  <input value={d.name} onChange={(e) => patch(d.id, "name", e.target.value)}
-                    placeholder={t.itemPlaceholder}
-                    className="min-w-0 flex-1 bg-transparent text-body-s font-medium text-text-high placeholder:text-text-disabled outline-none" />
-                  <input value={d.qty} onChange={(e) => patch(d.id, "qty", e.target.value)}
-                    placeholder={t.qtyPlaceholder}
-                    className="w-14 shrink-0 bg-transparent text-right text-body-xs font-medium text-text-disabled placeholder:text-text-disabled outline-none" />
-                </div>
-              ))}
+              {drafts.map((d) => {
+                /* Fix 3: single combined input — display "Potato 2 kg" */
+                const displayValue = d.qty ? `${d.name} ${d.qty}`.trim() : d.name;
+                return (
+                  <div key={d.id} className="flex items-center gap-3 rounded-xl bg-gray-100 px-3 py-3">
+                    <button onClick={() => toggle(d.id)}
+                      aria-label={d.include ? "Included" : "Skipped"}
+                      className={cn(
+                        "flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition-colors",
+                        d.include ? "border-primary bg-primary" : "border-gray-200",
+                      )}>
+                      {d.include && <Check size={11} className="text-white" />}
+                    </button>
+                    {/* Single combined field: type "potato 2 kgs", we parse it */}
+                    <input
+                      value={displayValue}
+                      onChange={(e) => handleCombinedChange(d.id, e.target.value)}
+                      placeholder={t.itemPlaceholder}
+                      /* Fix 3: auto-focus newly added rows */
+                      autoFocus={d.focusOnMount}
+                      onFocus={() => {
+                        // Clear focusOnMount flag after first focus
+                        if (d.focusOnMount) patchDraft(d.id, { focusOnMount: false });
+                      }}
+                      className="min-w-0 flex-1 bg-transparent text-body-s font-medium text-text-high placeholder:text-text-disabled outline-none"
+                    />
+                  </div>
+                );
+              })}
+
               <button onClick={addAnother}
                 className="flex items-center gap-1.5 px-1 py-1 text-body-xs font-bold text-text-low">
                 <Plus size={13} />{t.addAnother}
               </button>
             </div>
+
             <PillButton primary full disabled={count === 0} onClick={() => onConfirm(drafts)}>
               Add {count} item{count === 1 ? "" : "s"}
             </PillButton>
@@ -925,7 +1106,9 @@ function AddSheet({
 
 /* ──────────────────────────────────────────────────────────────────────────
  * BuySheet — capture → reconcile (tap to tick) → update list.
- * Same async Sarvam path as AddSheet, but parses bought item names.
+ * Fix 4: matchBought now uses synonym dictionary (चावल = Rice).
+ * Fix 5: cleanMarkdown pre-processes OCR output before parseItems.
+ * Fix 8: reconcile CTA is "Done" → closes sheet, returns to list view.
  * ────────────────────────────────────────────────────────────────────────── */
 
 function BuySheet({
@@ -955,7 +1138,6 @@ function BuySheet({
     setProcessing(true);
 
     if (mode === "voice") {
-      // ── Live Sarvam STT ──
       if (data && data.size > 0) {
         try {
           const transcript = await sarvamSTT(data);
@@ -972,11 +1154,12 @@ function BuySheet({
       setStage("reconcile");
 
     } else if (mode === "scan") {
-      // ── Live Sarvam OCR ──
       if (data instanceof File && data.size > 0) {
         try {
-          const extracted = await sarvamOCR(data);
-          const parsed = parseItems(extracted);
+          const raw = await sarvamOCR(data);
+          // Fix 5: clean Markdown before parsing
+          const cleaned = cleanMarkdown(raw);
+          const parsed = parseItems(cleaned);
           applyMatch(parsed.length > 0 ? parsed.map((p) => p.name) : fallbackNames());
         } catch (err) {
           console.error("[BuySheet] OCR failed, using fallback:", err);
@@ -989,7 +1172,6 @@ function BuySheet({
       setStage("reconcile");
 
     } else {
-      // ── Type ──
       window.setTimeout(() => {
         applyMatch(recognize(text).map((p) => p.name));
         setProcessing(false);
@@ -1017,6 +1199,7 @@ function BuySheet({
               <p className="text-title-s font-bold text-text-high">{t.reconcileTitle}</p>
               <p className="mt-0.5 text-body-xs font-medium text-text-disabled">{t.reconcileHint}</p>
             </div>
+
             <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
               {items.map((it) => {
                 const on = ticked[it.id];
@@ -1052,6 +1235,8 @@ function BuySheet({
                 </div>
               )}
             </div>
+
+            {/* Fix 8: "Done" closes sheet and returns to My List */}
             <PillButton primary full onClick={() => onConfirm(chosen)}>
               {t.updateList}
             </PillButton>
