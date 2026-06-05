@@ -505,6 +505,11 @@ export default function HouseholdHub() {
     setAddOpen(true);
   };
 
+  /** Direct tap-to-tick: toggle an item's bought state from the list view (issue #3). */
+  const toggleItem = (id: string) => {
+    setItems((prev) => prev.map((it) => it.id === id ? { ...it, bought: !it.bought } : it));
+  };
+
   /**
    * Fix #6 + #7: parse name+qty here at commit time, not during keystroke.
    * If the user edited a draft in the confirm screen (rawEdit present),
@@ -541,12 +546,24 @@ export default function HouseholdHub() {
     flashToast(`${incoming.length} item${incoming.length === 1 ? "" : "s"} added`);
   };
 
-  const applyBought = (ids: string[]) => {
+  /**
+   * Issue #2: also accepts newBoughtNames — items the user spoke that weren't
+   * on the list. They get added to the list and immediately marked as bought.
+   */
+  const applyBought = (ids: string[], newBoughtNames: string[] = []) => {
     const set = new Set(ids);
-    setItems((prev) => prev.map((it) => ({ ...it, bought: set.has(it.id) })));
+    setItems((prev) => {
+      const updated = prev.map((it) => ({ ...it, bought: set.has(it.id) }));
+      const have = new Set(updated.map((i) => norm2(i.name)));
+      const brandNew = newBoughtNames
+        .map((n) => canonicalize(n))
+        .filter((name) => !have.has(norm2(name)))
+        .map((name, i) => ({ id: `it-new-${Date.now()}-${i}`, name, qty: "", bought: true }));
+      return [...updated, ...brandNew];
+    });
     setBuyOpen(false);
-    const remaining = items.length - ids.length;
-    flashToast(`${ids.length} marked bought · ${remaining < 0 ? 0 : remaining} ${t.toBuySuffix}`);
+    const total = ids.length + newBoughtNames.length;
+    flashToast(`${total} marked bought`);
   };
 
   const reset = () => {
@@ -565,7 +582,7 @@ export default function HouseholdHub() {
         <>
           <TabBar t={t} lang={lang} setLang={setLang} tab={tab} setTab={setTab} onReset={reset} />
           {tab === "list" ? (
-            <ListView t={t} lang={lang} items={items} onBuy={() => setBuyOpen(true)} onAdd={() => openAdd("type")} />
+            <ListView t={t} lang={lang} items={items} onBuy={() => setBuyOpen(true)} onAdd={() => openAdd("type")} onToggle={toggleItem} />
           ) : (
             <HistoryView t={t} lang={lang} />
           )}
@@ -664,8 +681,11 @@ function StartScreen({ t, lang, setLang, onCreate }: {
   t: typeof EN; lang: Lang; setLang: (l: Lang) => void; onCreate: (mode: Mode) => void;
 }) {
   return (
-    <div className="pt-safe flex min-h-0 flex-1 flex-col">
-      <div className="flex shrink-0 items-center justify-end px-4 py-3">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div
+        className="flex shrink-0 items-center justify-end px-4 pb-3"
+        style={{ paddingTop: "max(16px, env(safe-area-inset-top))" }}
+      >
         <LangToggle lang={lang} setLang={setLang} />
       </div>
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-2">
@@ -724,7 +744,11 @@ function TabBar({ t, lang, setLang, tab, setTab, onReset }: {
   tab: "list" | "history"; setTab: (v: "list" | "history") => void; onReset: () => void;
 }) {
   return (
-    <header className="pt-safe shrink-0 bg-white px-4 pt-3 pb-2.5 shadow-low">
+    /* Issue #4: min 16px top padding so icons are never clipped by browser chrome */
+    <header
+      className="shrink-0 bg-white px-4 pb-2.5 shadow-low"
+      style={{ paddingTop: "max(16px, env(safe-area-inset-top))" }}
+    >
       <div className="mb-2.5 flex items-center justify-between">
         <button onClick={onReset} aria-label="Reset"
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary">
@@ -743,25 +767,37 @@ function TabBar({ t, lang, setLang, tab, setTab, onReset }: {
   );
 }
 
-/* ─── List view — Fix #8: more vertical breathing room ───────────────────── */
+/* ─── List view ───────────────────────────────────────────────────────────── */
+/*
+ * Issue #1 fix: absolute-positioned button bar so it's always visible at
+ * the bottom regardless of list length. The scroll area gets bottom padding
+ * to compensate so no content is hidden behind the buttons.
+ *
+ * Issue #3 fix: "to buy" items have a tappable circle that marks them bought
+ * directly without opening the BuySheet. Tap to tick; tap again to untick.
+ */
 
-function ListView({ t, lang, items, onBuy, onAdd }: {
-  t: typeof EN; lang: Lang; items: Item[]; onBuy: () => void; onAdd: () => void;
+function ListView({ t, lang, items, onBuy, onAdd, onToggle }: {
+  t: typeof EN; lang: Lang; items: Item[];
+  onBuy: () => void; onAdd: () => void; onToggle: (id: string) => void;
 }) {
   const toBuy  = items.filter((i) => !i.bought);
   const bought = items.filter((i) => i.bought);
 
   return (
-    <>
-      {/* Fix #8: py-6 for top/bottom breathing room */}
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6">
+    /* Relative container fills remaining space after TabBar */
+    <div className="relative min-h-0 flex-1">
+
+      {/* Scrollable list — pb-28 leaves room for the button bar */}
+      <div className="absolute inset-0 overflow-y-auto px-4 pt-6 pb-28">
+
         <p className="mb-5 text-body-xs font-medium text-text-disabled">
           {toBuy.length} {t.toBuySuffix}
           {bought.length > 0 ? ` · ${bought.length} ${t.boughtSuffix}` : ""}
         </p>
 
         {items.length === 0 && (
-          <p className="mt-8 text-center text-body-s font-medium text-text-disabled">{t.emptyListNote}</p>
+          <p className="mt-12 text-center text-body-s font-medium text-text-disabled">{t.emptyListNote}</p>
         )}
 
         {toBuy.length > 0 && (
@@ -769,13 +805,18 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
             {toBuy.map((it, i) => (
               <React.Fragment key={it.id}>
                 {i > 0 && <div className="h-px bg-gray-200" />}
-                <div className="flex items-center gap-3 py-3.5">
-                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+                {/* Issue #3: full row is tappable; circle shows tap affordance */}
+                <button
+                  onClick={() => onToggle(it.id)}
+                  className="flex w-full items-center gap-3 py-3.5 text-left active:bg-gray-50 rounded-lg transition-colors"
+                >
+                  {/* Empty circle → tap to mark bought */}
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 border-gray-300 transition-colors" />
                   <span className="flex-1 text-body-s font-medium text-text-high">
                     {displayName(it.name, lang)}
                   </span>
                   {it.qty && <span className="text-body-xs font-medium text-text-disabled">{it.qty}</span>}
-                </div>
+                </button>
               </React.Fragment>
             ))}
           </div>
@@ -791,7 +832,11 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
               {bought.map((it, i) => (
                 <React.Fragment key={it.id}>
                   {i > 0 && <div className="h-px bg-gray-200" />}
-                  <div className="flex items-center gap-3 py-3.5">
+                  {/* Bought items: tap to un-tick back to list */}
+                  <button
+                    onClick={() => onToggle(it.id)}
+                    className="flex w-full items-center gap-3 py-3.5 text-left active:bg-gray-50 rounded-lg transition-colors"
+                  >
                     <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-success">
                       <Check size={11} className="text-white" />
                     </span>
@@ -799,7 +844,7 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
                       {displayName(it.name, lang)}
                     </span>
                     {it.qty && <span className="text-body-xs font-medium text-text-disabled line-through">{it.qty}</span>}
-                  </div>
+                  </button>
                 </React.Fragment>
               ))}
             </div>
@@ -807,7 +852,11 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
         )}
       </div>
 
-      <div className="pb-safe flex shrink-0 flex-col gap-2.5 bg-white px-4 py-5">
+      {/* Issue #1: absolute-pinned button bar — always visible, never pushed down */}
+      <div
+        className="absolute bottom-0 left-0 right-0 bg-white px-4 py-4 flex flex-col gap-2.5 border-t border-gray-100"
+        style={{ paddingBottom: "max(16px, env(safe-area-inset-bottom))" }}
+      >
         <PillButton primary full onClick={onBuy} disabled={toBuy.length === 0}>
           <Check size={18} />{t.markBought}
         </PillButton>
@@ -815,7 +864,8 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
           <Plus size={18} />{t.addMore}
         </PillButton>
       </div>
-    </>
+
+    </div>
   );
 }
 
@@ -1181,10 +1231,15 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
   );
 }
 
-/* ─── BuySheet — Fix #5: starts in "type" mode ────────────────────────────── */
+/* ─── BuySheet ────────────────────────────────────────────────────────────── */
+/*
+ * Issue #2: if user says an item that's not on the list, it gets passed back
+ * via onConfirm's second argument so applyBought can add it + mark it bought.
+ */
 
 function BuySheet({ t, lang, items, onClose, onConfirm }: {
-  t: typeof EN; lang: Lang; items: Item[]; onClose: () => void; onConfirm: (ids: string[]) => void;
+  t: typeof EN; lang: Lang; items: Item[]; onClose: () => void;
+  onConfirm: (ids: string[], newBoughtNames: string[]) => void;
 }) {
   // Fix #5: default "type" — mic permission NOT requested on open
   const [mode,       setMode]       = React.useState<Mode>("type");
@@ -1280,15 +1335,19 @@ function BuySheet({ t, lang, items, onClose, onConfirm }: {
                 </p>
               )}
               {unmatched.length > 0 && (
-                <div className="flex items-start gap-2.5 rounded-xl bg-gray-100 p-3">
-                  <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
+                /* Issue #2: unmatched items will be auto-added + marked bought on Done */
+                <div className="flex items-start gap-2.5 rounded-xl bg-indigo-50 p-3">
+                  <Plus size={14} className="mt-0.5 shrink-0 text-primary" />
                   <p className="text-body-xs font-medium text-text-high">
-                    {unmatched.map((n) => displayName(canonicalize(n), lang)).join(", ")} — {t.notMatched}
+                    {unmatched.map((n) => displayName(canonicalize(n), lang)).join(", ")}
+                    {" — "}
+                    {lang === "hi" ? "सूची में जोड़कर खरीदा गया दिखाएंगे" : "will be added to your list and marked bought"}
                   </p>
                 </div>
               )}
             </div>
-            <PillButton primary full onClick={() => onConfirm(chosen)}>
+            {/* Pass unmatched names so applyBought can add + mark them bought */}
+            <PillButton primary full onClick={() => onConfirm(chosen, unmatched)}>
               {t.updateList}
             </PillButton>
           </>
