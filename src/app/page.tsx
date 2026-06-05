@@ -22,10 +22,10 @@ import {
  * JBIQ indigo colour scheme (#3535f3) from JBIQ design system.
  *
  * LANGUAGE FLOW:
- *   • Items are always stored with a canonical English key.
- *   • canonicalize(rawName) maps any Hindi/Hinglish/English variant → key.
- *   • displayName(key, lang) renders the stored key in the selected language.
- *   • matchBought uses synonym groups so cross-language ticking works.
+ *   • Items stored as canonical English key (canonicalize on add).
+ *   • displayName(key, lang) renders in selected language everywhere.
+ *   • Confirm screen shows translated name; onChange stores rawEdit (unprocessed).
+ *   • addItems() parses rawEdit at submit time → fixes space+qty typing bugs.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /* ─── i18n strings ────────────────────────────────────────────────────────── */
@@ -70,8 +70,7 @@ const EN = {
   notMatched: "not on your list",
   updateList: "Done",
   sampleNote: "Sample data — not from your activity",
-  historyFooter:
-    "Every bill or photo would be recorded here — your spending ledger builds from this.",
+  historyFooter: "Every bill or photo would be recorded here — your spending ledger builds from this.",
   emptyListNote: "Your list is empty — add items to get going.",
   micDenied: "Mic access denied. Switch to Type mode or allow microphone access.",
 };
@@ -126,7 +125,21 @@ const HI: typeof EN = {
 type Lang = "en" | "hi";
 type Mode = "voice" | "type" | "scan";
 type Item = { id: string; name: string; qty: string; bought: boolean };
-type Draft = { id: string; name: string; qty: string; include: boolean; focusOnMount?: boolean };
+
+/**
+ * rawEdit: the user's literal typed value in the confirm screen (undefined = untouched).
+ * At submit time, rawEdit is parsed for name+qty. This avoids the live-parse
+ * bugs that ate trailing spaces and dropped quantities (issues #6 and #7).
+ */
+type Draft = {
+  id: string;
+  name: string; // canonical raw name from voice/OCR
+  qty: string;
+  include: boolean;
+  focusOnMount?: boolean;
+  rawEdit?: string;
+};
+
 type HistEntry = { id: string; store: string; icon: string; date: string; amount: string; items: string };
 
 /* ─── Sample data ─────────────────────────────────────────────────────────── */
@@ -137,12 +150,44 @@ const SAMPLE_HISTORY: HistEntry[] = [
   { id: "s3", store: "Local kirana",   icon: "🏪", date: "19 May", amount: "₹180", items: "rice, dal, sugar" },
 ];
 
+/** Store name translations for Hindi history view (issue #4). */
+const STORE_NAMES_HI: Record<string, string> = {
+  "Reliance Fresh": "रिलायंस फ्रेश",
+  "Blinkit": "ब्लिंकिट",
+  "Local kirana": "स्थानीय किराना",
+  "JioMart": "जिओमार्ट",
+  "Smart Bazaar": "स्मार्ट बाज़ार",
+  "BigBasket": "बिगबास्केट",
+  "Amazon": "अमेज़न",
+};
+
+const MONTHS_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const MONTHS_HI = ["जन","फर","मार्च","अप्रैल","मई","जून","जुलाई","अग","सित","अक्त","नव","दिस"];
+
+function localiseDate(date: string, lang: Lang): string {
+  if (lang !== "hi") return date;
+  let d = date;
+  MONTHS_EN.forEach((m, i) => { d = d.replace(m, MONTHS_HI[i]); });
+  return d;
+}
+
 /* ─── Parser ──────────────────────────────────────────────────────────────── */
 
+/** Normalise Devanagari numerals → Arabic (e.g. ४ → 4) for quantity parsing. */
+function normalizeDigits(s: string): string {
+  return s.replace(/[०-९]/g, (d) => String(d.codePointAt(0)! - "०".codePointAt(0)!));
+}
+
+// NUM: Arabic digits + English words + common Hinglish + Hindi words
 const NUM =
-  "(?:\\d+(?:\\.\\d+)?|half|a|one|two|three|four|five|six|seven|eight|nine|ten|dozen|ek|do|teen|char|paanch|aadha)";
+  "(?:\\d+(?:\\.\\d+)?|half|a|one|two|three|four|five|six|seven|eight|nine|ten|twelve|twenty|dozen" +
+  "|ek|do|teen|char|paanch|chhe|saat|aath|nau|das|baara|bees" +
+  "|एक|दो|तीन|चार|पाँच|छह|सात|आठ|नौ|दस|बारह|बीस|आधा|aadha)";
+
+// UNIT: English + Hindi abbreviations/words
 const UNIT =
-  "(?:kgs?|kilos?|kilo|grams?|gms?|g|litres?|liters?|ltr|ml|l|pkts?|packets?|pcs?|pieces?|piece|dozen|gucch|bundle)";
+  "(?:kgs?|kilos?|kilo|किलो|grams?|gms?|g|ग्राम|litres?|liters?|ltr|ml|l|लीटर" +
+  "|pkts?|packets?|पैकेट|pcs?|pieces?|piece|पीस|नग|dozen|दर्जन|gucch|bundle)";
 
 function cap(s: string): string {
   s = s.trim();
@@ -171,7 +216,8 @@ function cleanMarkdown(raw: string): string {
 
 function parseItems(raw: string): { name: string; qty: string }[] {
   if (!raw.trim()) return [];
-  const parts = raw
+  const normalised = normalizeDigits(raw);
+  const parts = normalised
     .split(/,|\n|;|\band\b|\baur\b|और/gi)
     .map((p) => p.trim())
     .filter(Boolean);
@@ -180,14 +226,23 @@ function parseItems(raw: string): { name: string; qty: string }[] {
     .map((part) => {
       let name = part;
       let qty = "";
+
+      // Pattern 1: has NUM+UNIT anywhere (e.g. "milk 2 kg", "2 kg milk")
       const m = part.match(qtyRe);
       if (m) {
         qty = m[0].replace(/\s+/g, " ").trim();
         name = part.replace(m[0], " ");
       } else {
-        const lead = part.match(/^\s*(\d+(?:\.\d+)?)\s+(.+)$/);
-        if (lead) { qty = lead[1]; name = lead[2]; }
+        // Pattern 2: number-first ("2 milk", "4 onion")
+        const numFirst = part.match(/^\s*(\d+(?:\.\d+)?)\s+(.+)$/);
+        if (numFirst) { qty = numFirst[1]; name = numFirst[2]; }
+        else {
+          // Pattern 3: number-last ("milk 2", "onions 4") — bare number after item name
+          const numLast = part.match(/^(.+?)\s+(\d+(?:\.\d+)?)$/);
+          if (numLast) { qty = numLast[2]; name = numLast[1]; }
+        }
       }
+
       name = name.replace(/\s{2,}/g, " ").replace(/^[-•*]\s*/, "").trim();
       if (!name) { name = part; qty = ""; }
       return { name: cap(name), qty };
@@ -197,26 +252,25 @@ function parseItems(raw: string): { name: string; qty: string }[] {
 
 /* ─── Fallback samples ────────────────────────────────────────────────────── */
 
-const VOICE_SAMPLE    = "milk, three kilo rice, one packet salt";
-const VOICE_SAMPLE_HI = "दूध, तीन किलो चावल, एक पैकेट नमक";
+const VOICE_SAMPLE    = "milk, 3 kg rice, 1 packet salt";
+const VOICE_SAMPLE_HI = "दूध, 3 किलो चावल, 1 पैकेट नमक";
 const SCAN_SAMPLE     = "Aashirvaad Atta 5 kg\nOnion 1 kg\nTata Salt 1 pkt\nAmul Milk 1 l";
 
 function recognize(typed: string): { name: string; qty: string }[] {
   return parseItems(typed);
 }
 
-function norm(s: string): string {
+function norm2(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9ऀ-ॿ ]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 /* ─── Canonical item dictionary ───────────────────────────────────────────── */
-/*
- * All items are stored by their canonical English key (lowercase).
- * canonicalize() maps any input variant → key.
- * displayName() renders the key in the user's chosen language.
- */
 
-/** English canonical → Hindi display name. */
+/**
+ * English canonical key → Hindi display name.
+ * Covers grocery items, household items, clothing, and common brands.
+ * Unknown items display in their original script (no bad transliteration).
+ */
 const CANONICAL_TO_HI: Record<string, string> = {
   // Grains & staples
   rice: "चावल", atta: "आटा", maida: "मैदा", suji: "सूजी",
@@ -225,18 +279,17 @@ const CANONICAL_TO_HI: Record<string, string> = {
   jowar: "ज्वार", maize: "मकई",
   // Pulses
   dal: "दाल", moong: "मूंग दाल", chana: "चना", rajma: "राजमा",
-  urad: "उड़द दाल", toor: "तूर दाल", masoor: "मसूर दाल", lentils: "दाल",
+  urad: "उड़द दाल", toor: "तूर दाल", masoor: "मसूर दाल",
   // Dairy
-  milk: "दूध", curd: "दही", yogurt: "दही", paneer: "पनीर",
-  ghee: "घी", butter: "मक्खन", cheese: "चीज़", cream: "मलाई",
-  buttermilk: "छाछ",
+  milk: "दूध", curd: "दही", paneer: "पनीर", ghee: "घी",
+  butter: "मक्खन", cheese: "चीज़", cream: "मलाई", buttermilk: "छाछ",
   // Vegetables
   potato: "आलू", onion: "प्याज", tomato: "टमाटर", garlic: "लहसुन",
   ginger: "अदरक", carrot: "गाजर", peas: "मटर", cauliflower: "गोभी",
   cabbage: "पत्तागोभी", spinach: "पालक", ladyfinger: "भिंडी",
   brinjal: "बैंगन", bittergourd: "करेला", bottlegourd: "लौकी",
-  drumstick: "सहजन", mushroom: "मशरूम", capsicum: "शिमला मिर्च",
-  pumpkin: "कद्दू", radish: "मूली", beetroot: "चुकंदर", beans: "फलियाँ",
+  mushroom: "मशरूम", capsicum: "शिमला मिर्च", pumpkin: "कद्दू",
+  radish: "मूली", beetroot: "चुकंदर", beans: "फलियाँ",
   // Fruits
   mango: "आम", banana: "केला", apple: "सेब", orange: "संतरा",
   lemon: "नींबू", grapes: "अंगूर", pomegranate: "अनार", papaya: "पपीता",
@@ -246,11 +299,10 @@ const CANONICAL_TO_HI: Record<string, string> = {
   salt: "नमक", turmeric: "हल्दी", cumin: "जीरा", coriander: "धनिया",
   chili: "मिर्च", pepper: "काली मिर्च", cardamom: "इलायची",
   cloves: "लौंग", cinnamon: "दालचीनी", mustard: "सरसों",
-  fennel: "सौंफ", fenugreek: "मेथी", asafoetida: "हींग",
-  masala: "मसाला", tamarind: "इमली",
+  fennel: "सौंफ", fenugreek: "मेथी", asafoetida: "हींग", masala: "मसाला",
   // Sweeteners & condiments
   sugar: "चीनी", jaggery: "गुड़", honey: "शहद",
-  pickle: "अचार", ketchup: "केचप", jam: "जैम", vinegar: "सिरका",
+  pickle: "अचार", ketchup: "केचप", jam: "जैम", tamarind: "इमली",
   // Oils & nuts
   oil: "तेल", groundnut: "मूंगफली", sesame: "तिल",
   // Snacks & processed
@@ -266,64 +318,86 @@ const CANONICAL_TO_HI: Record<string, string> = {
   // Personal care
   soap: "साबुन", shampoo: "शैम्पू", toothpaste: "टूथपेस्ट",
   toothbrush: "टूथब्रश", handwash: "हैंडवॉश", sanitizer: "सैनिटाइज़र",
+  deodorant: "डियोड्रेंट",
   // Household
   detergent: "डिटर्जेंट", tissues: "टिशू",
+  bucket: "बाल्टी", towel: "तौलिया", bedsheet: "चादर", curtain: "पर्दा",
+  bulb: "बल्ब", battery: "बैटरी",
+  // Clothing & accessories
+  shirt: "कमीज़", tshirt: "टी-शर्ट", pant: "पैंट", socks: "मोज़े",
+  underwear: "अंडरवेयर", saree: "साड़ी", dupatta: "दुपट्टा",
+  // General household items
+  scissors: "कैंची", pen: "पेन", pencil: "पेंसिल", paper: "कागज़",
+  notebook: "नोटबुक", bag: "बैग", umbrella: "छाता",
+  pillow: "तकिया", cushion: "तकिया", bed: "बिस्तर", mattress: "गद्दा",
+  television: "टेलीविज़न", phone: "फ़ोन", charger: "चार्जर",
+  laptop: "लैपटॉप",
 };
 
-/** Synonym groups for cross-language matching. */
+/** Synonym groups for canonical matching (Hindi/Hinglish/English → canonical key). */
 const SYNONYMS: Record<string, string[]> = {
-  rice:       ["चावल", "chawal", "chaawal", "bhaat", "javal"],
-  milk:       ["दूध", "doodh", "dudh"],
-  salt:       ["नमक", "namak", "loon"],
-  atta:       ["आटा", "flour", "wheat flour", "gehun", "गेहूं"],
-  onion:      ["प्याज", "pyaaz", "pyaz", "kanda"],
-  potato:     ["आलू", "aloo", "aalu", "batata"],
-  tomato:     ["टमाटर", "tamatar"],
-  sugar:      ["चीनी", "cheeni", "shakkar"],
-  dal:        ["दाल", "lentil", "lentils", "arhar", "moong", "masoor", "chana"],
-  oil:        ["तेल", "tel", "cooking oil", "sarson"],
-  bread:      ["ब्रेड", "pav", "pau"],
-  egg:        ["अंडा", "anda", "eggs", "अंडे"],
-  ghee:       ["घी", "ghi"],
-  tea:        ["चाय", "chai"],
-  coffee:     ["कॉफी", "kaafi"],
-  soap:       ["साबुन", "sabun"],
-  shampoo:    ["शैम्पू", "shampu"],
-  paneer:     ["पनीर", "cottage cheese"],
-  curd:       ["दही", "dahi", "yogurt", "dahee"],
-  butter:     ["मक्खन", "makhan"],
-  biscuit:    ["बिस्किट", "biskut"],
-  chips:      ["चिप्स"],
-  water:      ["पानी", "paani"],
-  mango:      ["आम", "aam", "mangoes"],
-  banana:     ["केला", "kela", "kele"],
-  apple:      ["सेब", "seb"],
-  lemon:      ["नींबू", "nimbu", "neembu"],
-  coriander:  ["धनिया", "dhaniya", "dhaniya", "cilantro"],
-  ginger:     ["अदरक", "adrak"],
-  garlic:     ["लहसुन", "lahsun"],
-  turmeric:   ["हल्दी", "haldi"],
-  cumin:      ["जीरा", "jeera"],
-  chili:      ["मिर्च", "mirch"],
-  peas:       ["मटर", "matar"],
-  cauliflower:["गोभी", "gobhi", "phool gobhi"],
-  spinach:    ["पालक", "palak"],
-  ladyfinger: ["भिंडी", "bhindi", "okra"],
-  maggi:      ["मैगी"],
-  noodles:    ["नूडल्स"],
-  cornflakes: ["कॉर्नफ्लेक्स"],
-  chocolate:  ["चॉकलेट"],
-  jaggery:    ["गुड़", "gur"],
-  honey:      ["शहद", "shahad"],
-  pickle:     ["अचार", "achaar"],
+  rice:        ["चावल", "chawal", "chaawal", "bhaat", "javal"],
+  milk:        ["दूध", "doodh", "dudh"],
+  salt:        ["नमक", "namak", "loon"],
+  atta:        ["आटा", "flour", "wheat flour", "gehun", "गेहूं"],
+  onion:       ["प्याज", "pyaaz", "pyaz", "kanda"],
+  potato:      ["आलू", "aloo", "aalu", "batata"],
+  tomato:      ["टमाटर", "tamatar"],
+  sugar:       ["चीनी", "cheeni", "shakkar", "chini"],
+  dal:         ["दाल", "lentil", "lentils", "arhar", "moong", "masoor", "chana"],
+  oil:         ["तेल", "tel", "cooking oil", "sarson"],
+  bread:       ["ब्रेड", "pav", "pau"],
+  egg:         ["अंडा", "anda", "eggs", "अंडे"],
+  ghee:        ["घी", "ghi"],
+  tea:         ["चाय", "chai"],
+  coffee:      ["कॉफी", "kaafi"],
+  soap:        ["साबुन", "sabun"],
+  shampoo:     ["शैम्पू", "shampu"],
+  paneer:      ["पनीर", "cottage cheese"],
+  curd:        ["दही", "dahi", "yogurt", "dahee"],
+  butter:      ["मक्खन", "makhan"],
+  biscuit:     ["बिस्किट", "biskut"],
+  chips:       ["चिप्स"],
+  water:       ["पानी", "paani"],
+  mango:       ["आम", "aam", "mangoes"],
+  banana:      ["केला", "kela", "kele"],
+  apple:       ["सेब", "seb"],
+  lemon:       ["नींबू", "nimbu", "neembu"],
+  coriander:   ["धनिया", "dhaniya", "cilantro", "धनिये"],
+  ginger:      ["अदरक", "adrak"],
+  garlic:      ["लहसुन", "lahsun"],
+  turmeric:    ["हल्दी", "haldi"],
+  cumin:       ["जीरा", "jeera", "zeera"],
+  chili:       ["मिर्च", "mirch"],
+  peas:        ["मटर", "matar"],
+  cauliflower: ["गोभी", "gobhi", "phool gobhi"],
+  spinach:     ["पालक", "palak"],
+  ladyfinger:  ["भिंडी", "bhindi", "okra"],
+  guava:       ["अमरूद", "amrood"],
+  jaggery:     ["गुड़", "gur"],
+  honey:       ["शहद", "shahad"],
+  pickle:      ["अचार", "achaar"],
+  maggi:       ["मैगी"],
+  noodles:     ["नूडल्स"],
+  cornflakes:  ["कॉर्नफ्लेक्स"],
+  // Household & clothing
+  scissors:    ["कैंची", "kaichi", "sisar", "सिज़र", "scissor"],
+  shirt:       ["कमीज़", "kamiz", "कमीज"],
+  socks:       ["मोज़े", "moze", "juraab", "सॉक्स", "jurab"],
+  bed:         ["बिस्तर", "bistar", "palang", "पलंग"],
+  pillow:      ["तकिया", "takiya", "पिलो", "pilo"],
+  cushion:     ["कुशन", "takiya"],
+  deodorant:   ["डियोड्रेंट", "deo", "डियो"],
+  television:  ["टेलीविज़न", "टीवी", "tivi", "tv"],
+  pen:         ["पेन", "pen"],
+  paper:       ["कागज़", "kagaz", "पेपर", "pepper"],
+  bag:         ["बैग"],
+  umbrella:    ["छाता", "chhata"],
+  bedsheet:    ["चादर", "chadar"],
+  towel:       ["तौलिया", "towelia"],
+  soap_dish:   ["साबुनदानी"],
 };
 
-/** Normalise string for matching. */
-function norm2(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9ऀ-ॿ ]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-/** Return the full synonym set (all variants) for a given name. */
 function getSynonymGroup(name: string): Set<string> {
   const n = norm2(name);
   const group = new Set<string>([n]);
@@ -337,41 +411,25 @@ function getSynonymGroup(name: string): Set<string> {
   return group;
 }
 
-/**
- * Map any input (Hindi Devanagari, Hinglish, English) to its canonical
- * English key. If not in the dictionary, returns the input as-is (capitalised).
- */
 function canonicalize(rawName: string): string {
   const n = norm2(rawName);
-
-  // Exact match
   for (const [eng, synonyms] of Object.entries(SYNONYMS)) {
     if (norm2(eng) === n || synonyms.some((s) => norm2(s) === n)) return eng;
   }
-
   // Partial/substring match (catches "दो किलो चावल" → "rice")
   for (const [eng, synonyms] of Object.entries(SYNONYMS)) {
     const terms = [norm2(eng), ...synonyms.map(norm2)];
     if (terms.some((t) => t.length > 2 && n.includes(t))) return eng;
   }
-
-  // Not in dictionary: return original
   return rawName;
 }
 
-/**
- * Render a canonical item name in the user's selected language.
- * Unknown items (not in CANONICAL_TO_HI) render in their original script.
- */
 function displayName(name: string, lang: Lang): string {
   if (lang === "hi") {
-    const key = name.toLowerCase();
-    const hi = CANONICAL_TO_HI[key];
+    const hi = CANONICAL_TO_HI[name.toLowerCase()];
     if (hi) return hi;
-    // Already Devanagari
-    if (/[ऀ-ॿ]/.test(name)) return name;
-    // Unknown item — keep original (Roman)
-    return name;
+    if (/[ऀ-ॿ]/.test(name)) return name; // already Devanagari
+    return name; // Roman — not in dict, show as-is
   }
   return cap(name);
 }
@@ -425,14 +483,14 @@ async function sarvamOCR(file: File): Promise<string> {
 /* ─── Root ────────────────────────────────────────────────────────────────── */
 
 export default function HouseholdHub() {
-  const [lang, setLang] = React.useState<Lang>("en");
-  const [started, setStarted] = React.useState(false);
-  const [tab, setTab] = React.useState<"list" | "history">("list");
-  const [items, setItems] = React.useState<Item[]>([]);
-  const [addOpen, setAddOpen] = React.useState(false);
-  const [addInitialMode, setAddInitialMode] = React.useState<Mode>("voice");
-  const [buyOpen, setBuyOpen] = React.useState(false);
-  const [toast, setToast] = React.useState<string | null>(null);
+  const [lang, setLang]             = React.useState<Lang>("en");
+  const [started, setStarted]       = React.useState(false);
+  const [tab, setTab]               = React.useState<"list" | "history">("list");
+  const [items, setItems]           = React.useState<Item[]>([]);
+  const [addOpen, setAddOpen]       = React.useState(false);
+  const [addInitialMode, setAddInitialMode] = React.useState<Mode>("type");
+  const [buyOpen, setBuyOpen]       = React.useState(false);
+  const [toast, setToast]           = React.useState<string | null>(null);
 
   const t = lang === "hi" ? HI : EN;
 
@@ -441,23 +499,41 @@ export default function HouseholdHub() {
     window.setTimeout(() => setToast(null), 2200);
   };
 
-  const openAdd = (mode: Mode = "voice") => {
+  // Fix #5: default mode is "type" — no mic permission until user explicitly taps "Speak"
+  const openAdd = (mode: Mode = "type") => {
     setAddInitialMode(mode);
     setAddOpen(true);
   };
 
+  /**
+   * Fix #6 + #7: parse name+qty here at commit time, not during keystroke.
+   * If the user edited a draft in the confirm screen (rawEdit present),
+   * we parse rawEdit to extract proper name and quantity.
+   */
   const addItems = (drafts: Draft[]) => {
-    const incoming = drafts.filter((d) => d.include && d.name.trim());
+    const incoming = drafts.filter((d) => d.include && (d.rawEdit?.trim() || d.name.trim()));
     setItems((prev) => {
       const have = new Set(prev.map((i) => norm2(i.name)));
       const fresh = incoming
-        .filter((d) => !have.has(norm2(canonicalize(d.name))))
-        .map((d, i) => ({
-          id: `it-${Date.now()}-${i}`,
-          name: canonicalize(d.name), // store canonical English key
-          qty: d.qty.trim(),
-          bought: false,
-        }));
+        .filter((d) => {
+          const raw = d.rawEdit !== undefined ? d.rawEdit : d.name;
+          return !have.has(norm2(canonicalize(raw)));
+        })
+        .map((d, i) => {
+          // rawEdit = user typed; use parseItems on it to re-extract name+qty
+          const raw = d.rawEdit !== undefined
+            ? d.rawEdit
+            : d.qty ? `${d.name} ${d.qty}` : d.name;
+          const parsed = parseItems(raw);
+          const finalName = canonicalize(parsed[0]?.name ?? d.name);
+          const finalQty  = parsed[0]?.qty || d.qty || "";
+          return {
+            id: `it-${Date.now()}-${i}`,
+            name: finalName,
+            qty: finalQty.trim(),
+            bought: false,
+          };
+        });
       return [...prev, ...fresh];
     });
     setStarted(true);
@@ -489,7 +565,7 @@ export default function HouseholdHub() {
         <>
           <TabBar t={t} lang={lang} setLang={setLang} tab={tab} setTab={setTab} onReset={reset} />
           {tab === "list" ? (
-            <ListView t={t} lang={lang} items={items} onBuy={() => setBuyOpen(true)} onAdd={() => openAdd("voice")} />
+            <ListView t={t} lang={lang} items={items} onBuy={() => setBuyOpen(true)} onAdd={() => openAdd("type")} />
           ) : (
             <HistoryView t={t} lang={lang} />
           )}
@@ -500,6 +576,7 @@ export default function HouseholdHub() {
         <AddSheet t={t} lang={lang} initialMode={addInitialMode} onClose={() => setAddOpen(false)} onConfirm={addItems} />
       )}
       {buyOpen && (
+        // Fix #5: BuySheet starts in "type" mode — mic not requested until Speak is tapped
         <BuySheet t={t} lang={lang} items={items} onClose={() => setBuyOpen(false)} onConfirm={applyBought} />
       )}
 
@@ -514,43 +591,35 @@ export default function HouseholdHub() {
   );
 }
 
-/* ─── Chip (tabs + lang toggle — neutral dark active state) ──────────────── */
+/* ─── Chip (tabs / lang toggle) ──────────────────────────────────────────── */
 
-function Chip({
-  active, onClick, children, className,
-}: {
+function Chip({ active, onClick, children, className }: {
   active?: boolean; onClick?: () => void; children: React.ReactNode; className?: string;
 }) {
   return (
-    <button
-      onClick={onClick}
+    <button onClick={onClick}
       className={cn(
         "rounded-full border px-3 py-1 text-label-s font-bold transition-colors",
         active ? "border-gray-900 bg-gray-900 text-gray-100" : "border-gray-300 bg-gray-200 text-gray-900",
         className,
-      )}
-    >
+      )}>
       {children}
     </button>
   );
 }
 
-/* ─── ModeTab (input mode selector inside sheets — indigo active state) ──── */
+/* ─── ModeTab (input mode selector — indigo active) ──────────────────────── */
 
-function ModeTab({
-  active, onClick, children, className,
-}: {
+function ModeTab({ active, onClick, children, className }: {
   active?: boolean; onClick?: () => void; children: React.ReactNode; className?: string;
 }) {
   return (
-    <button
-      onClick={onClick}
+    <button onClick={onClick}
       className={cn(
         "flex flex-1 items-center justify-center gap-1.5 rounded-full border py-2.5 text-label-l font-bold transition-colors",
         active ? "border-primary bg-primary text-white" : "border-gray-300 bg-gray-100 text-gray-700",
         className,
-      )}
-    >
+      )}>
       {children}
     </button>
   );
@@ -558,23 +627,18 @@ function ModeTab({
 
 /* ─── Pill button ─────────────────────────────────────────────────────────── */
 
-function PillButton({
-  primary, full, disabled, onClick, children, className,
-}: {
+function PillButton({ primary, full, disabled, onClick, children, className }: {
   primary?: boolean; full?: boolean; disabled?: boolean;
   onClick?: () => void; children: React.ReactNode; className?: string;
 }) {
   return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
+    <button onClick={onClick} disabled={disabled}
       className={cn(
         "flex items-center justify-center gap-2 rounded-full py-3.5 text-button font-bold transition-colors disabled:opacity-40",
         primary ? "bg-primary text-white" : "bg-gray-100 text-text-high",
         full && "w-full",
         className,
-      )}
-    >
+      )}>
       {children}
     </button>
   );
@@ -596,17 +660,14 @@ function LangToggle({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void 
 
 /* ─── Start screen ────────────────────────────────────────────────────────── */
 
-function StartScreen({
-  t, lang, setLang, onCreate,
-}: {
-  t: typeof EN; lang: Lang; setLang: (l: Lang) => void; onCreate: (mode?: Mode) => void;
+function StartScreen({ t, lang, setLang, onCreate }: {
+  t: typeof EN; lang: Lang; setLang: (l: Lang) => void; onCreate: (mode: Mode) => void;
 }) {
   return (
     <div className="pt-safe flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center justify-end px-4 py-3">
         <LangToggle lang={lang} setLang={setLang} />
       </div>
-
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-2">
         <div className="mb-5 flex h-20 w-20 items-center justify-center rounded-full bg-primary">
           <ShoppingBasket size={36} className="text-white" />
@@ -623,17 +684,15 @@ function StartScreen({
           <BenefitTile iconBg="bg-blue-50"   icon={<Bell  size={18} className="text-blue-600"   />} label={t.benefitPending} />
         </div>
       </div>
-
       <div className="pb-safe shrink-0 px-4 pb-4 pt-3">
-        {/* Mode chips: bg-primary (indigo) — clearly actionable, not muted */}
         <div className="mb-3 flex gap-2">
+          {/* Explicit mode selection — only "Speak" starts mic */}
           <ModeEntryChip icon={<Mic      size={14} />} label={t.modeSpeak} onClick={() => onCreate("voice")} />
           <ModeEntryChip icon={<Keyboard size={14} />} label={t.modeType}  onClick={() => onCreate("type")}  />
           <ModeEntryChip icon={<Camera   size={14} />} label={t.modeScan}  onClick={() => onCreate("scan")}  />
         </div>
-        <PillButton primary full onClick={() => onCreate("voice")}>
-          <Plus size={18} />
-          {t.createCta}
+        <PillButton primary full onClick={() => onCreate("type")}>
+          <Plus size={18} />{t.createCta}
         </PillButton>
       </div>
     </div>
@@ -651,27 +710,21 @@ function BenefitTile({ iconBg, icon, label }: { iconBg: string; icon: React.Reac
 
 function ModeEntryChip({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick: () => void }) {
   return (
-    <button
-      onClick={onClick}
-      className="flex flex-1 items-center justify-center gap-1 overflow-hidden rounded-full bg-primary px-2 py-2.5 text-label-s font-bold whitespace-nowrap text-white transition-colors active:bg-indigo-700"
-    >
-      {icon}
-      <span className="truncate">{label}</span>
+    <button onClick={onClick}
+      className="flex flex-1 items-center justify-center gap-1 overflow-hidden rounded-full bg-primary px-2 py-2.5 text-label-s font-bold whitespace-nowrap text-white transition-colors active:bg-indigo-700">
+      {icon}<span className="truncate">{label}</span>
     </button>
   );
 }
 
-/* ─── Tab bar — 2 rows: lang toggle / tabs ────────────────────────────────── */
+/* ─── Tab bar — 2 rows ────────────────────────────────────────────────────── */
 
-function TabBar({
-  t, lang, setLang, tab, setTab, onReset,
-}: {
+function TabBar({ t, lang, setLang, tab, setTab, onReset }: {
   t: typeof EN; lang: Lang; setLang: (l: Lang) => void;
   tab: "list" | "history"; setTab: (v: "list" | "history") => void; onReset: () => void;
 }) {
   return (
     <header className="pt-safe shrink-0 bg-white px-4 pt-3 pb-2.5 shadow-low">
-      {/* Row 1: logo + lang toggle */}
       <div className="mb-2.5 flex items-center justify-between">
         <button onClick={onReset} aria-label="Reset"
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary">
@@ -679,7 +732,6 @@ function TabBar({
         </button>
         <LangToggle lang={lang} setLang={setLang} />
       </div>
-      {/* Row 2: navigation tabs */}
       <div className="flex gap-1.5">
         {(["list", "history"] as const).map((id) => (
           <Chip key={id} active={tab === id} onClick={() => setTab(id)} className="flex-1 text-center">
@@ -691,7 +743,7 @@ function TabBar({
   );
 }
 
-/* ─── List view ───────────────────────────────────────────────────────────── */
+/* ─── List view — Fix #8: more vertical breathing room ───────────────────── */
 
 function ListView({ t, lang, items, onBuy, onAdd }: {
   t: typeof EN; lang: Lang; items: Item[]; onBuy: () => void; onAdd: () => void;
@@ -701,8 +753,9 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
 
   return (
     <>
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-        <p className="mb-4 text-body-xs font-medium text-text-disabled">
+      {/* Fix #8: py-6 for top/bottom breathing room */}
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6">
+        <p className="mb-5 text-body-xs font-medium text-text-disabled">
           {toBuy.length} {t.toBuySuffix}
           {bought.length > 0 ? ` · ${bought.length} ${t.boughtSuffix}` : ""}
         </p>
@@ -716,7 +769,7 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
             {toBuy.map((it, i) => (
               <React.Fragment key={it.id}>
                 {i > 0 && <div className="h-px bg-gray-200" />}
-                <div className="flex items-center gap-3 py-3">
+                <div className="flex items-center gap-3 py-3.5">
                   <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
                   <span className="flex-1 text-body-s font-medium text-text-high">
                     {displayName(it.name, lang)}
@@ -729,7 +782,7 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
         )}
 
         {bought.length > 0 && (
-          <div>
+          <div className="mb-4">
             <p className="mb-3 flex items-center gap-1.5 text-overline font-bold uppercase tracking-wide text-text-disabled">
               <Check size={11} className="text-success" />
               {t.boughtHeading} · {bought.length}
@@ -738,7 +791,7 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
               {bought.map((it, i) => (
                 <React.Fragment key={it.id}>
                   {i > 0 && <div className="h-px bg-gray-200" />}
-                  <div className="flex items-center gap-3 py-3">
+                  <div className="flex items-center gap-3 py-3.5">
                     <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-success">
                       <Check size={11} className="text-white" />
                     </span>
@@ -754,7 +807,7 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
         )}
       </div>
 
-      <div className="pb-safe flex shrink-0 flex-col gap-2.5 bg-white px-4 py-4">
+      <div className="pb-safe flex shrink-0 flex-col gap-2.5 bg-white px-4 py-5">
         <PillButton primary full onClick={onBuy} disabled={toBuy.length === 0}>
           <Check size={18} />{t.markBought}
         </PillButton>
@@ -766,12 +819,13 @@ function ListView({ t, lang, items, onBuy, onAdd }: {
   );
 }
 
-/* ─── History view ────────────────────────────────────────────────────────── */
+/* ─── History view — Fix #4: store names + dates in Hindi ────────────────── */
 
 function HistoryView({ t, lang }: { t: typeof EN; lang: Lang }) {
-  // Translate sample history item names
   const entries = SAMPLE_HISTORY.map((h) => ({
     ...h,
+    store: lang === "hi" ? (STORE_NAMES_HI[h.store] ?? h.store) : h.store,
+    date: localiseDate(h.date, lang),
     items: h.items
       .split(", ")
       .map((name) => displayName(canonicalize(name.trim()), lang))
@@ -779,7 +833,7 @@ function HistoryView({ t, lang }: { t: typeof EN; lang: Lang }) {
   }));
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6">
       <div className="mb-4 flex items-center gap-2.5 rounded-xl bg-gray-100 p-3.5">
         <AlertTriangle size={14} className="shrink-0 text-text-disabled" />
         <p className="text-body-xs font-medium text-text-low">{t.sampleNote}</p>
@@ -824,7 +878,7 @@ function Sheet({ title, onClose, children }: { title: string; onClose: () => voi
   );
 }
 
-/* ─── Mode chips (inside sheets) ─────────────────────────────────────────── */
+/* ─── Mode chips ──────────────────────────────────────────────────────────── */
 
 function ModeChips({ t, mode, setMode, scanLabel }: {
   t: typeof EN; mode: Mode; setMode: (m: Mode) => void; scanLabel: string;
@@ -860,9 +914,7 @@ function SkeletonLoader({ label }: { label: string }) {
 
 /* ─── CapturePane ─────────────────────────────────────────────────────────── */
 
-function CapturePane({
-  t, mode, text, setText, processing, onCapture, pictureMode,
-}: {
+function CapturePane({ t, mode, text, setText, processing, onCapture, pictureMode }: {
   t: typeof EN; mode: Mode; text: string; setText: (s: string) => void;
   processing: boolean; onCapture: (data?: Blob | File) => void; pictureMode: boolean;
 }) {
@@ -873,6 +925,7 @@ function CapturePane({
   const [micGranted, setMicGranted] = React.useState<boolean | null>(null);
   const [stopping,   setStopping]   = React.useState(false);
 
+  // Fix #5: recording starts ONLY when mode is "voice" (not on default type/scan open)
   React.useEffect(() => {
     if (mode !== "voice" || processing) return;
     setStopping(false);
@@ -921,7 +974,6 @@ function CapturePane({
 
   if (processing) return <SkeletonLoader label={mode === "scan" ? t.scanReading : t.reading} />;
 
-  /* ── Voice ── */
   if (mode === "voice") {
     if (micGranted === false) {
       return (
@@ -943,7 +995,7 @@ function CapturePane({
             <Mic size={24} className={cn("text-white", micGranted === true && !stopping && "animate-pulse")} />
           </span>
           <p className="text-body-s font-medium text-text-high">
-            {stopping ? (t === HI ? "पढ़ रहे हैं…" : "Reading…") : t.listening}
+            {stopping ? t.reading : t.listening}
           </p>
           {micGranted === null && (
             <p className="px-6 text-center text-body-xs font-medium text-text-disabled">
@@ -957,13 +1009,12 @@ function CapturePane({
           )}
         </div>
         <PillButton primary full disabled={stopping} onClick={handleDone}>
-          {stopping ? (t === HI ? "पढ़ रहे हैं…" : "Reading…") : t.stopRead}
+          {stopping ? t.reading : t.stopRead}
         </PillButton>
       </div>
     );
   }
 
-  /* ── Scan — stacked buttons: camera + gallery ── */
   if (mode === "scan") {
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
@@ -974,16 +1025,11 @@ function CapturePane({
       <div className="flex flex-col gap-3">
         <input ref={cameraInputRef}  type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFileChange} />
         <input ref={galleryInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileChange} />
-
-        <button
-          onClick={() => cameraInputRef.current?.click()}
-          className="flex min-h-32 flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 bg-gray-100"
-        >
+        <button onClick={() => cameraInputRef.current?.click()}
+          className="flex min-h-32 flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-200 bg-gray-100">
           <Camera size={28} className="text-text-disabled" />
           <p className="px-6 text-center text-body-xs font-medium text-text-disabled">{t.scanPrompt}</p>
         </button>
-
-        {/* Stacked buttons — no overflow */}
         <PillButton primary full onClick={() => cameraInputRef.current?.click()}>
           <Camera size={16} />{t.scanCta}
         </PillButton>
@@ -994,7 +1040,7 @@ function CapturePane({
     );
   }
 
-  /* ── Type ── */
+  // Type mode — autoFocus opens keyboard immediately when type tab is selected
   return (
     <div className="flex flex-col gap-3">
       <textarea
@@ -1014,12 +1060,10 @@ function CapturePane({
 
 /* ─── AddSheet ────────────────────────────────────────────────────────────── */
 
-function AddSheet({
-  t, lang, initialMode, onClose, onConfirm,
-}: {
+function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
   t: typeof EN; lang: Lang; initialMode?: Mode; onClose: () => void; onConfirm: (drafts: Draft[]) => void;
 }) {
-  const [mode,       setMode]       = React.useState<Mode>(initialMode ?? "voice");
+  const [mode,       setMode]       = React.useState<Mode>(initialMode ?? "type");
   const [stage,      setStage]      = React.useState<"capture" | "confirm">("capture");
   const [text,       setText]       = React.useState("");
   const [processing, setProcessing] = React.useState(false);
@@ -1036,15 +1080,6 @@ function AddSheet({
 
   const addAnother = () =>
     setDrafts((prev) => [...prev, { id: `d-${Date.now()}`, name: "", qty: "", include: true, focusOnMount: true }]);
-
-  const handleCombinedChange = (id: string, value: string) => {
-    const parsed = parseItems(value);
-    if (parsed.length === 1 && parsed[0].name) {
-      patchDraft(id, { name: parsed[0].name, qty: parsed[0].qty });
-    } else {
-      patchDraft(id, { name: value, qty: "" });
-    }
-  };
 
   const capture = async (data?: Blob | File) => {
     setProcessing(true);
@@ -1078,7 +1113,7 @@ function AddSheet({
     }
   };
 
-  const count = drafts.filter((d) => d.include && d.name.trim()).length;
+  const count = drafts.filter((d) => d.include && (d.rawEdit?.trim() || d.name.trim())).length;
 
   return (
     <Sheet title={t.addTitle} onClose={onClose}>
@@ -1097,7 +1132,19 @@ function AddSheet({
             </div>
             <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
               {drafts.map((d) => {
-                const displayValue = d.qty ? `${d.name} ${d.qty}`.trim() : d.name;
+                /**
+                 * Fix #1, #2, #6, #7:
+                 * - Display: shows translated canonical name + qty (so Hindi speakers see Hindi)
+                 * - If user has edited (rawEdit present): show their raw typed text
+                 * - onChange: store raw value in rawEdit — NO live parsing (fixes space bug)
+                 * - Actual parsing happens in addItems() at submit time
+                 */
+                const displayVal = d.rawEdit !== undefined
+                  ? d.rawEdit
+                  : d.qty
+                    ? `${displayName(canonicalize(d.name), lang)} ${d.qty}`.trim()
+                    : displayName(canonicalize(d.name), lang);
+
                 return (
                   <div key={d.id} className="flex items-center gap-3 rounded-xl bg-gray-100 px-3 py-3">
                     <button onClick={() => toggle(d.id)}
@@ -1109,8 +1156,8 @@ function AddSheet({
                       {d.include && <Check size={11} className="text-white" />}
                     </button>
                     <input
-                      value={displayValue}
-                      onChange={(e) => handleCombinedChange(d.id, e.target.value)}
+                      value={displayVal}
+                      onChange={(e) => patchDraft(d.id, { rawEdit: e.target.value })}
                       placeholder={t.itemPlaceholder}
                       autoFocus={d.focusOnMount}
                       onFocus={() => { if (d.focusOnMount) patchDraft(d.id, { focusOnMount: false }); }}
@@ -1134,14 +1181,13 @@ function AddSheet({
   );
 }
 
-/* ─── BuySheet ────────────────────────────────────────────────────────────── */
+/* ─── BuySheet — Fix #5: starts in "type" mode ────────────────────────────── */
 
-function BuySheet({
-  t, lang, items, onClose, onConfirm,
-}: {
+function BuySheet({ t, lang, items, onClose, onConfirm }: {
   t: typeof EN; lang: Lang; items: Item[]; onClose: () => void; onConfirm: (ids: string[]) => void;
 }) {
-  const [mode,       setMode]       = React.useState<Mode>("voice");
+  // Fix #5: default "type" — mic permission NOT requested on open
+  const [mode,       setMode]       = React.useState<Mode>("type");
   const [stage,      setStage]      = React.useState<"capture" | "reconcile">("capture");
   const [text,       setText]       = React.useState("");
   const [processing, setProcessing] = React.useState(false);
