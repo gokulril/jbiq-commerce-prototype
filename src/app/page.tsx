@@ -398,6 +398,98 @@ const SYNONYMS: Record<string, string[]> = {
   soap_dish:   ["साबुनदानी"],
 };
 
+/* ─── Category system ─────────────────────────────────────────────────────── */
+
+type Category =
+  | "vegetables" | "fruits" | "dairy" | "grains" | "pulses"
+  | "spices" | "snacks" | "beverages" | "protein"
+  | "personal_care" | "household" | "clothing" | "other";
+
+const CATEGORY_ORDER: Category[] = [
+  "vegetables", "fruits", "dairy", "grains", "pulses",
+  "spices", "snacks", "beverages", "protein",
+  "personal_care", "household", "clothing", "other",
+];
+
+const CATEGORY_LABELS_EN: Record<Category, string> = {
+  vegetables: "Vegetables", fruits: "Fruits", dairy: "Dairy",
+  grains: "Grains & Staples", pulses: "Pulses", spices: "Spices & Condiments",
+  snacks: "Snacks & Packaged", beverages: "Beverages", protein: "Protein",
+  personal_care: "Personal Care", household: "Household",
+  clothing: "Clothing", other: "Other",
+};
+
+const CATEGORY_LABELS_HI: Record<Category, string> = {
+  vegetables: "सब्जियाँ", fruits: "फल", dairy: "डेयरी",
+  grains: "अनाज", pulses: "दालें", spices: "मसाले",
+  snacks: "स्नैक्स", beverages: "पेय", protein: "प्रोटीन",
+  personal_care: "स्वच्छता", household: "घरेलू",
+  clothing: "कपड़े", other: "अन्य",
+};
+
+const CANONICAL_TO_CATEGORY: Record<string, Category> = {
+  // Vegetables
+  potato: "vegetables", onion: "vegetables", tomato: "vegetables",
+  garlic: "vegetables", ginger: "vegetables", carrot: "vegetables",
+  peas: "vegetables", cauliflower: "vegetables", cabbage: "vegetables",
+  spinach: "vegetables", ladyfinger: "vegetables", brinjal: "vegetables",
+  bittergourd: "vegetables", bottlegourd: "vegetables", mushroom: "vegetables",
+  capsicum: "vegetables", pumpkin: "vegetables", radish: "vegetables",
+  beetroot: "vegetables", beans: "vegetables",
+  // Fruits
+  mango: "fruits", banana: "fruits", apple: "fruits", orange: "fruits",
+  lemon: "fruits", grapes: "fruits", pomegranate: "fruits", papaya: "fruits",
+  guava: "fruits", watermelon: "fruits", coconut: "fruits",
+  pineapple: "fruits", strawberry: "fruits",
+  // Dairy
+  milk: "dairy", curd: "dairy", paneer: "dairy", ghee: "dairy",
+  butter: "dairy", cheese: "dairy", cream: "dairy", buttermilk: "dairy",
+  // Grains & Staples
+  rice: "grains", atta: "grains", maida: "grains", suji: "grains",
+  poha: "grains", besan: "grains", cornflour: "grains", cornflakes: "grains",
+  wheat: "grains", bajra: "grains", jowar: "grains", maize: "grains",
+  // Pulses
+  dal: "pulses", moong: "pulses", chana: "pulses", rajma: "pulses",
+  urad: "pulses", toor: "pulses", masoor: "pulses",
+  // Spices & Condiments
+  salt: "spices", turmeric: "spices", cumin: "spices", coriander: "spices",
+  chili: "spices", pepper: "spices", cardamom: "spices", cloves: "spices",
+  cinnamon: "spices", mustard: "spices", fennel: "spices",
+  fenugreek: "spices", asafoetida: "spices", masala: "spices",
+  tamarind: "spices", sugar: "spices", jaggery: "spices", honey: "spices",
+  pickle: "spices", ketchup: "spices", jam: "spices", oil: "spices",
+  sesame: "spices", groundnut: "spices",
+  // Snacks & Packaged
+  biscuit: "snacks", chips: "snacks", namkeen: "snacks", papad: "snacks",
+  chocolate: "snacks", maggi: "snacks", noodles: "snacks", pasta: "snacks",
+  bread: "snacks", cake: "snacks",
+  // Beverages
+  tea: "beverages", coffee: "beverages", water: "beverages",
+  juice: "beverages", lassi: "beverages",
+  // Protein
+  egg: "protein", chicken: "protein", mutton: "protein", fish: "protein",
+  // Personal Care
+  soap: "personal_care", shampoo: "personal_care", toothpaste: "personal_care",
+  toothbrush: "personal_care", handwash: "personal_care",
+  sanitizer: "personal_care", deodorant: "personal_care",
+  // Household
+  detergent: "household", tissues: "household",
+  bucket: "household", towel: "household", bedsheet: "household",
+  curtain: "household", bulb: "household", battery: "household",
+  // Clothing
+  shirt: "clothing", tshirt: "clothing", pant: "clothing", socks: "clothing",
+  underwear: "clothing", saree: "clothing", dupatta: "clothing",
+  // Other (electronics, stationery, etc.) — also the fallback
+  scissors: "other", pen: "other", pencil: "other", paper: "other",
+  notebook: "other", bag: "other", umbrella: "other",
+  pillow: "other", cushion: "other", bed: "other", mattress: "other",
+  television: "other", phone: "other", charger: "other", laptop: "other",
+};
+
+function getCategory(canonicalName: string): Category {
+  return CANONICAL_TO_CATEGORY[canonicalName.toLowerCase()] ?? "other";
+}
+
 function getSynonymGroup(name: string): Set<string> {
   const n = norm2(name);
   const group = new Set<string>([n]);
@@ -768,14 +860,42 @@ function TabBar({ t, lang, setLang, tab, setTab, onReset }: {
 }
 
 /* ─── List view ───────────────────────────────────────────────────────────── */
-/*
- * Issue #1 fix: absolute-positioned button bar so it's always visible at
- * the bottom regardless of list length. The scroll area gets bottom padding
- * to compensate so no content is hidden behind the buttons.
- *
- * Issue #3 fix: "to buy" items have a tappable circle that marks them bought
- * directly without opening the BuySheet. Tap to tick; tap again to untick.
- */
+
+function ListItemRow({ it, lang, onToggle, bought = false }: {
+  it: Item; lang: Lang; onToggle: (id: string) => void; bought?: boolean;
+}) {
+  return (
+    <button
+      onClick={() => onToggle(it.id)}
+      className={cn(
+        "flex w-full items-center gap-3 py-3 text-left rounded-lg transition-colors active:bg-gray-50",
+        bought && "opacity-60",
+      )}
+    >
+      {bought ? (
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-success">
+          <Check size={11} className="text-white" />
+        </span>
+      ) : (
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 border-gray-300" />
+      )}
+      <span className={cn(
+        "flex-1 text-body-s font-medium",
+        bought ? "text-text-low line-through" : "text-text-high",
+      )}>
+        {displayName(it.name, lang)}
+      </span>
+      {it.qty && (
+        <span className={cn(
+          "text-body-xs font-medium text-text-disabled",
+          bought && "line-through",
+        )}>
+          {it.qty}
+        </span>
+      )}
+    </button>
+  );
+}
 
 function ListView({ t, lang, items, onBuy, onAdd, onToggle }: {
   t: typeof EN; lang: Lang; items: Item[];
@@ -784,11 +904,15 @@ function ListView({ t, lang, items, onBuy, onAdd, onToggle }: {
   const toBuy  = items.filter((i) => !i.bought);
   const bought = items.filter((i) => i.bought);
 
+  // Group "to buy" items by category in grocery-aisle order
+  const grouped = CATEGORY_ORDER
+    .map((cat) => ({ cat, rows: toBuy.filter((it) => getCategory(it.name) === cat) }))
+    .filter((g) => g.rows.length > 0);
+
   return (
-    /* Relative container fills remaining space after TabBar */
     <div className="relative min-h-0 flex-1">
 
-      {/* Scrollable list — pb-28 leaves room for the button bar */}
+      {/* Scrollable list */}
       <div className="absolute inset-0 overflow-y-auto px-4 pt-6 pb-28">
 
         <p className="mb-5 text-body-xs font-medium text-text-disabled">
@@ -800,51 +924,36 @@ function ListView({ t, lang, items, onBuy, onAdd, onToggle }: {
           <p className="mt-12 text-center text-body-s font-medium text-text-disabled">{t.emptyListNote}</p>
         )}
 
-        {toBuy.length > 0 && (
-          <div className="mb-6">
-            {toBuy.map((it, i) => (
-              <React.Fragment key={it.id}>
-                {i > 0 && <div className="h-px bg-gray-200" />}
-                {/* Issue #3: full row is tappable; circle shows tap affordance */}
-                <button
-                  onClick={() => onToggle(it.id)}
-                  className="flex w-full items-center gap-3 py-3.5 text-left active:bg-gray-50 rounded-lg transition-colors"
-                >
-                  {/* Empty circle → tap to mark bought */}
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 border-gray-300 transition-colors" />
-                  <span className="flex-1 text-body-s font-medium text-text-high">
-                    {displayName(it.name, lang)}
-                  </span>
-                  {it.qty && <span className="text-body-xs font-medium text-text-disabled">{it.qty}</span>}
-                </button>
-              </React.Fragment>
-            ))}
+        {/* Categorised "to buy" sections */}
+        {grouped.map(({ cat, rows }) => (
+          <div key={cat} className="mb-5">
+            {/* Category header */}
+            <p className="mb-1 text-overline font-bold uppercase tracking-wider text-text-disabled">
+              {lang === "hi" ? CATEGORY_LABELS_HI[cat] : CATEGORY_LABELS_EN[cat]}
+            </p>
+            <div className="rounded-xl bg-gray-50 px-3">
+              {rows.map((it, i) => (
+                <React.Fragment key={it.id}>
+                  {i > 0 && <div className="h-px bg-gray-200" />}
+                  <ListItemRow it={it} lang={lang} onToggle={onToggle} />
+                </React.Fragment>
+              ))}
+            </div>
           </div>
-        )}
+        ))}
 
+        {/* Bought section — flat list, no category grouping needed */}
         {bought.length > 0 && (
           <div className="mb-4">
-            <p className="mb-3 flex items-center gap-1.5 text-overline font-bold uppercase tracking-wide text-text-disabled">
+            <p className="mb-1 flex items-center gap-1.5 text-overline font-bold uppercase tracking-wider text-text-disabled">
               <Check size={11} className="text-success" />
               {t.boughtHeading} · {bought.length}
             </p>
-            <div className="opacity-60">
+            <div className="rounded-xl bg-gray-50 px-3">
               {bought.map((it, i) => (
                 <React.Fragment key={it.id}>
                   {i > 0 && <div className="h-px bg-gray-200" />}
-                  {/* Bought items: tap to un-tick back to list */}
-                  <button
-                    onClick={() => onToggle(it.id)}
-                    className="flex w-full items-center gap-3 py-3.5 text-left active:bg-gray-50 rounded-lg transition-colors"
-                  >
-                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-success">
-                      <Check size={11} className="text-white" />
-                    </span>
-                    <span className="flex-1 text-body-s font-medium text-text-low line-through">
-                      {displayName(it.name, lang)}
-                    </span>
-                    {it.qty && <span className="text-body-xs font-medium text-text-disabled line-through">{it.qty}</span>}
-                  </button>
+                  <ListItemRow it={it} lang={lang} onToggle={onToggle} bought />
                 </React.Fragment>
               ))}
             </div>
@@ -852,7 +961,7 @@ function ListView({ t, lang, items, onBuy, onAdd, onToggle }: {
         )}
       </div>
 
-      {/* Issue #1: absolute-pinned button bar — always visible, never pushed down */}
+      {/* Sticky button bar — always visible */}
       <div
         className="absolute bottom-0 left-0 right-0 bg-white px-4 py-4 flex flex-col gap-2.5 border-t border-gray-100"
         style={{ paddingBottom: "max(16px, env(safe-area-inset-bottom))" }}
@@ -964,9 +1073,11 @@ function SkeletonLoader({ label }: { label: string }) {
 
 /* ─── CapturePane ─────────────────────────────────────────────────────────── */
 
-function CapturePane({ t, mode, text, setText, processing, onCapture, pictureMode }: {
+function CapturePane({ t, mode, text, setText, processing, onCapture, pictureMode, typeCta }: {
   t: typeof EN; mode: Mode; text: string; setText: (s: string) => void;
   processing: boolean; onCapture: (data?: Blob | File) => void; pictureMode: boolean;
+  /** Override the type-mode submit CTA label. Defaults to t.readList. */
+  typeCta?: string;
 }) {
   const recorderRef     = React.useRef<MediaRecorder | null>(null);
   const chunksRef       = React.useRef<Blob[]>([]);
@@ -1102,7 +1213,7 @@ function CapturePane({ t, mode, text, setText, processing, onCapture, pictureMod
         className="min-h-28 w-full resize-none rounded-xl bg-gray-100 px-4 py-3 text-body-m font-medium text-text-high placeholder:text-text-disabled outline-none focus:ring-2 focus:ring-primary"
       />
       <PillButton primary full disabled={!text.trim()} onClick={() => onCapture()}>
-        {t.readList}
+        {typeCta ?? t.readList}
       </PillButton>
     </div>
   );
@@ -1301,8 +1412,10 @@ function BuySheet({ t, lang, items, onClose, onConfirm }: {
         {stage === "capture" ? (
           <>
             <ModeChips t={t} mode={mode} setMode={setMode} scanLabel={t.modePicture} />
+            {/* Issue #1: type CTA = "Done"/"हो गया", not "Read my list" */}
             <CapturePane t={t} mode={mode} text={text} setText={setText}
-              processing={processing} onCapture={capture} pictureMode />
+              processing={processing} onCapture={capture} pictureMode
+              typeCta={t.updateList} />
           </>
         ) : (
           <>
