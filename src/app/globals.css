@@ -1,0 +1,84 @@
+@import "tailwindcss";
+@import "../styles/tokens.css";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  /* ─── Brand / semantic ──────────────────────────────────────────────────── */
+  --color-primary:    rgb(var(--color-primary-rgb));
+  --color-primary-fg: rgb(var(--color-primary-fg-rgb));
+  --color-success:    rgb(var(--color-success-rgb));
+  --color-warning:    rgb(var(--color-warning-rgb));
+  --color-danger:     rgb(var(--color-danger-rgb));
+  --color-info:       rgb(var(--color-info-rgb));
+
+  /* ─── Shadows ───────────────────────────────────────────────────────────── */
+  --shadow-high: var(--shadow-high);
+  --shadow-mid:  var(--shadow-mid);
+  --shadow-low:  var(--shadow-low);
+
+  /* ─── DESIGN.md surface tokens ──────────────────────────────────────────── */
+  --color-surface-1:         #ffffff;
+  --color-surface-2:         #f5f5f5;
+  --color-surface-card-on-1: #f5f5f5;
+  --color-surface-card-on-2: #ffffff;
+
+  /* ─── DESIGN.md text tokens ─────────────────────────────────────────────── */
+  --color-text-high:     #09090b;
+  --color-text-low:      #71717a;
+  --color-text-disabled: #a1a1aa;
+
+  /* ─── DESIGN.md stroke tokens ───────────────────────────────────────────── */
+  --color-stroke-on-surface-1: #f5f5f5;
+  --color-stroke-on-surface-2: #e5e5e5;
+  --color-stroke-on-card-on-1: #e5e5e5;
+  --color-stroke-on-card-on-2: #f5f5f5;
+
+  /* ─── DESIGN.md typography scale ────────────────────────────────────────── */
+  --text-headline-m:   28px;
+  --text-headline-s:   24px;
+  --text-headline-xs:  22px;
+  --text-headline-2xs: 20px;
+  --text-headline-3xs: 18px;
+  --text-title-l:      20px;
+  --text-title-m:      18px;
+  --text-title-s:      16px;
+  --text-title-2xs:    14px;
+  --text-body-l:       16px;
+  --text-body-m:       15px;
+  --text-body-s:       14px;
+  --text-body-xs:      13px;
+  --text-body-2xs:     12px;
+  --text-label-l:      14px;
+  --text-label-s:      12px;
+  --text-button:       14px;
+  --text-overline:     10px;
+}
+
+/* ─── JioType (DESIGN.md) ──────────────────────────────────────────────────── */
+@font-face {
+  font-family: 'JioType';
+  src: url('https://raw.githubusercontent.com/sunit1986/JioBharatIQ_Server/main/assets/fonts/woff2/JioTypeVarW05-Regular.woff2') format('woff2');
+  font-weight: 100 900;
+}
+
+html,
+body {
+  font-family: 'JioType', sans-serif;
+  background: white;
+  color: #09090b;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ─── Safe-area utilities ──────────────────────────────────────────────────── */
+@utility pt-safe { padding-top: env(safe-area-inset-top); }
+@utility pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+@utility px-safe { padding-inline: env(safe-area-inset-left) env(safe-area-inset-right); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

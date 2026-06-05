@@ -1,0 +1,31 @@
+/*
+ * Design tokens — Commerce vertical.
+ * Brand colour: warm tan #B4825A (light) / #D4AF8C (dark).
+ */
+
+:root {
+  --color-primary-rgb: 180 130 90;
+  --color-primary-fg-rgb: 255 255 255;
+  --color-success-rgb: 22 163 74;
+  --color-warning-rgb: 217 119 6;
+  --color-danger-rgb: 220 38 38;
+  --color-info-rgb: 2 132 199;
+
+  --shadow-high: 0 24px 48px -12px rgb(0 0 0 / 0.18);
+  --shadow-mid:  0 4px 12px -2px rgb(0 0 0 / 0.08), 0 2px 4px -2px rgb(0 0 0 / 0.06);
+  --shadow-low:  0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-primary-rgb: 212 175 140;
+    --color-primary-fg-rgb: 17 17 19;
+    --shadow-high: 0 24px 48px -12px rgb(0 0 0 / 0.7);
+  }
+}
+
+[data-theme="dark"] {
+  --color-primary-rgb: 212 175 140;
+  --color-primary-fg-rgb: 17 17 19;
+  --shadow-high: 0 24px 48px -12px rgb(0 0 0 / 0.7);
+}

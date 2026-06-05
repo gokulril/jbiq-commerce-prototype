@@ -1,0 +1,81 @@
+import { NextRequest, NextResponse } from "next/server";
+
+/**
+ * POST /commerce/api/stt
+ *
+ * Server-side proxy for Sarvam AI Saarika speech-to-text.
+ * Keeps SARVAM_API_KEY server-side (never exposed to the browser).
+ *
+ * Request: multipart/form-data with field "audio" (Blob — audio/webm or audio/mp4)
+ * Response: { transcript: string }
+ *
+ * ─── Deployment note ────────────────────────────────────────────────────────
+ * This route works in `npm run dev:commerce` (Next.js dev server).
+ * It is NOT included in `next build` because next.config.ts uses
+ * `output: "export"` (static export mode).
+ *
+ * For a production deployment that needs server-side STT:
+ *   1. Change next.config.ts: output → "standalone"  (enables API routes)
+ *   2. Deploy to a Node.js host (Vercel, Railway, etc.)
+ *   OR
+ *   3. Keep static export and proxy via a separate serverless function / BFF.
+ * ────────────────────────────────────────────────────────────────────────────
+ */
+
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  const apiKey = process.env.SARVAM_API_KEY;
+
+  if (!apiKey) {
+    console.error("[STT] SARVAM_API_KEY is not set.");
+    return NextResponse.json(
+      {
+        error:
+          "SARVAM_API_KEY is not configured. Copy apps/commerce/.env.local.example → " +
+          "apps/commerce/.env.local and paste your key from dashboard.sarvam.ai.",
+      },
+      { status: 500 },
+    );
+  }
+
+  let incoming: FormData;
+  try {
+    incoming = await req.formData();
+  } catch {
+    return NextResponse.json({ error: "Could not parse multipart body." }, { status: 400 });
+  }
+
+  const audio = incoming.get("audio");
+  if (!audio || !(audio instanceof Blob) || audio.size === 0) {
+    return NextResponse.json({ error: "Missing or empty audio field." }, { status: 400 });
+  }
+
+  // Forward to Sarvam Saarika v2
+  const sarvamForm = new FormData();
+  sarvamForm.append("file", audio, "recording.webm");
+  sarvamForm.append("model", "saaras:v3");  // Saaras v3 — latest, handles Hindi/English code-switching natively
+  sarvamForm.append("mode", "transcribe");  // transcribe | translate | codemix — use codemix for Hinglish output
+
+  let upstream: Response;
+  try {
+    upstream = await fetch("https://api.sarvam.ai/speech-to-text", {
+      method: "POST",
+      headers: { "api-subscription-key": apiKey },
+      body: sarvamForm,
+    });
+  } catch (err) {
+    console.error("[STT] Network error reaching Sarvam:", err);
+    return NextResponse.json({ error: "Could not reach Sarvam API." }, { status: 502 });
+  }
+
+  if (!upstream.ok) {
+    const detail = await upstream.text().catch(() => "(no body)");
+    console.error("[STT] Sarvam returned", upstream.status, detail);
+    return NextResponse.json(
+      { error: "Sarvam API error.", detail, status: upstream.status },
+      { status: upstream.status },
+    );
+  }
+
+  const data = (await upstream.json()) as { transcript?: string; language_code?: string };
+  return NextResponse.json({ transcript: data.transcript ?? "" });
+}
