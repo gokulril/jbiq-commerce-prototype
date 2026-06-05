@@ -49,11 +49,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "Missing or empty audio field." }, { status: 400 });
   }
 
-  // Forward to Sarvam Saarika v2
+  // Strip codec suffix — Sarvam rejects "audio/webm;codecs=opus" but accepts "audio/webm"
+  const baseMime = (audio.type || "audio/webm").split(";")[0].trim() || "audio/webm";
+  const cleanAudio = new Blob([await audio.arrayBuffer()], { type: baseMime });
+
   const sarvamForm = new FormData();
-  sarvamForm.append("file", audio, "recording.webm");
-  sarvamForm.append("model", "saaras:v3");  // Saaras v3 — latest, handles Hindi/English code-switching natively
-  sarvamForm.append("mode", "transcribe");  // transcribe | translate | codemix — use codemix for Hinglish output
+  sarvamForm.append("file", cleanAudio, "recording.webm");
+  sarvamForm.append("model", "saaras:v3");
+  sarvamForm.append("mode", "transcribe");
 
   let upstream: Response;
   try {
