@@ -1,10 +1,11 @@
 /*
  * Design tokens — Commerce vertical.
- * Brand colour: warm tan #B4825A (light) / #D4AF8C (dark).
+ * Brand colour: JBIQ indigo #3535f3 (light) / #000093 (dark).
+ * Source: Money Mitra / JBIQ design system (--jds-primary-50).
  */
 
 :root {
-  --color-primary-rgb: 180 130 90;
+  --color-primary-rgb: 53 53 243;
   --color-primary-fg-rgb: 255 255 255;
   --color-success-rgb: 22 163 74;
   --color-warning-rgb: 217 119 6;
@@ -18,14 +19,14 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-primary-rgb: 212 175 140;
-    --color-primary-fg-rgb: 17 17 19;
+    --color-primary-rgb: 83 74 183;
+    --color-primary-fg-rgb: 255 255 255;
     --shadow-high: 0 24px 48px -12px rgb(0 0 0 / 0.7);
   }
 }
 
 [data-theme="dark"] {
-  --color-primary-rgb: 212 175 140;
-  --color-primary-fg-rgb: 17 17 19;
+  --color-primary-rgb: 83 74 183;
+  --color-primary-fg-rgb: 255 255 255;
   --shadow-high: 0 24px 48px -12px rgb(0 0 0 / 0.7);
 }
