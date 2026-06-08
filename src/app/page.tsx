@@ -294,10 +294,30 @@ function displayQty(qty: string, lang: Lang): string {
   return s;
 }
 
+/**
+ * Lines that are clearly notes / reminders / to-dos, not shopping items.
+ * Handles the common case of a grocery list sharing a page with other jottings:
+ * arrow bullets (→ ➜ » or ascii "->"), tick/cross marks (✓ ✗), blockquote ">"
+ * markers (OCR often renders a handwritten arrow as ">"), and a tight set of note
+ * keywords. Kept deliberately narrow so real items — including Latin-script brand
+ * names like "Tata Salt" — are never dropped.
+ */
+function looksLikeNote(line: string): boolean {
+  const l = line.trim();
+  if (!l) return true;
+  if (/[→➜➔➤»]/.test(l)) return true;        // unicode arrows
+  if (/(^|\s)-+>/.test(l)) return true;        // ascii arrow "->"
+  if (/[✓✔✗✘☑✅❌]/.test(l)) return true;      // tick / cross marks
+  if (/^>+\s/.test(l)) return true;            // OCR'd arrow rendered as blockquote ">"
+  if (/\b(mail|e-?mail|call|meeting|reminder|to-?do)\b/i.test(l)) return true;
+  return false;
+}
+
 function cleanMarkdown(raw: string): string {
   return raw
     .split("\n")
     .map((line) => {
+      if (looksLikeNote(line)) return "";        // drop reminders / to-do jottings
       const stripped = line.replace(/[\s|:*_-]/g, "");
       if (!stripped) return "";
       line = line.replace(/^#+\s*/, "");
