@@ -1,11 +1,23 @@
 /**
  * Cloudflare Pages Function — POST /api/ocr
  *
- * Sarvam Document Intelligence proxy.
- * Handles both the old S3 backend and the current Azure_v1 backend,
- * trying every known response shape for upload/download URLs.
+ * Sarvam Document Intelligence (doc-digitization) proxy.
  *
- * Flow: Create job → Get upload URL → PUT image → Start job
+ * Schema verified against the official `sarvamai` Python SDK
+ * (document_intelligence/client.py + types/*), not guessed:
+ *
+ *   Step 2 (upload-files)   → { job_id, job_state, storage_container_type,
+ *                               upload_urls:  { "<filename>": { file_url, file_metadata } } }
+ *   Step 6 (download-files) → { job_id, job_state, storage_container_type,
+ *                               download_urls:{ "<filename>": { file_url, file_metadata } } }
+ *
+ * The two historical bugs this fixes:
+ *   1. Field is `upload_urls` (a MAP keyed by filename, value.file_url), not `upload_url`.
+ *      Same for `download_urls` on step 6 — neither is a top-level string.
+ *   2. The Azure_V1 blob PUT REQUIRES the header `x-ms-blob-type: BlockBlob`.
+ *      Without it Azure rejects the upload with HTTP 400.
+ *
+ * Flow: Create job → Get upload URL → PUT image (Azure) → Start job
  *       → Poll status → Get download URL → Download ZIP → Extract text
  */
 
@@ -18,115 +30,37 @@ interface Env {
 
 const SARVAM = "https://api.sarvam.ai";
 
-/**
- * Try every known field name and response shape to extract an https:// URL.
- * Covers: top-level string, nested object, arrays, Azure container+SAS combo,
- * and a regex fallback that scans the raw response text.
- */
-function extractUrl(raw: string, filename: string): string | undefined {
-  let data: Record<string, unknown> = {};
-  try { data = JSON.parse(raw); } catch { /* fall through to regex */ }
-
-  // 1. Top-level string URL (most common in current Azure API)
-  for (const key of ["upload_url", "file_url", "sas_url", "presigned_url", "url", "href"]) {
-    const v = data[key];
-    if (typeof v === "string" && v.startsWith("http")) return v;
-  }
-
-  // 2. Azure pattern: container URL (no SAS) + separate sas_token field
-  for (const key of ["upload_url", "container_url", "blob_url", "url"]) {
-    const v = data[key];
-    if (typeof v === "string" && v.length > 4 && typeof data.sas_token === "string") {
-      const base = v.endsWith("/") ? v : `${v}/`;
-      return `${base}${data.blob_name ?? filename}?${data.sas_token}`;
-    }
-  }
-
-  // 3. Nested object: { upload_url: { url: "https://..." } }
-  for (const key of ["upload_url", "upload", "file", "storage"]) {
-    const v = data[key];
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      const inner = v as Record<string, unknown>;
-      for (const ik of ["url", "href", "sas_url", "endpoint", "upload_url"]) {
-        if (typeof inner[ik] === "string" && (inner[ik] as string).startsWith("http"))
-          return inner[ik] as string;
-      }
-    }
-  }
-
-  // 4. Array responses: upload_details / files / items / results
-  const arr = [
-    ...(Array.isArray(data.upload_details) ? data.upload_details : []),
-    ...(Array.isArray(data.files)           ? data.files           : []),
-    ...(Array.isArray(data.file_details)    ? data.file_details    : []),
-    ...(Array.isArray(data.items)           ? data.items           : []),
-    ...(Array.isArray(data.results)         ? data.results         : []),
-  ] as Record<string, unknown>[];
-
-  for (const item of arr) {
-    for (const key of ["file_url", "upload_url", "sas_url", "presigned_url", "url", "href"]) {
-      if (typeof item[key] === "string" && (item[key] as string).startsWith("http"))
-        return item[key] as string;
-    }
-    // Azure array item with container + sas_token
-    if (typeof item.container_url === "string" && typeof item.sas_token === "string") {
-      const base = (item.container_url as string).endsWith("/")
-        ? item.container_url as string
-        : `${item.container_url}/`;
-      return `${base}${item.blob_name ?? filename}?${item.sas_token}`;
-    }
-  }
-
-  // 5. Regex on raw text — last resort, handles any encoding quirks
-  const urlPatterns = [
-    /"upload_url"\s*:\s*"(https?:(?:[^"\\]|\\.)*)"/,
-    /"file_url"\s*:\s*"(https?:(?:[^"\\]|\\.)*)"/,
-    /"sas_url"\s*:\s*"(https?:(?:[^"\\]|\\.)*)"/,
-    /"presigned_url"\s*:\s*"(https?:(?:[^"\\]|\\.)*)"/,
-    /"url"\s*:\s*"(https?:(?:[^"\\]|\\.)*)"/,
-  ];
-  for (const pat of urlPatterns) {
-    const m = raw.match(pat);
-    if (m) {
-      return m[1]
-        .replace(/\\u0026/g, "&")
-        .replace(/\\u003d/g, "=")
-        .replace(/\\u002b/g, "+")
-        .replace(/\\"/g, '"')
-        .replace(/\\\//g, "/");
-    }
-  }
-
-  return undefined;
+/** One entry in Sarvam's upload_urls / download_urls map. */
+interface FileSignedUrlDetails {
+  file_url?: string;
+  file_metadata?: Record<string, unknown>;
 }
+type SignedUrlMap = Record<string, FileSignedUrlDetails>;
 
-/** Same logic for the step-6 download URL. */
-function extractDownloadUrl(raw: string): string | undefined {
-  let data: Record<string, unknown> = {};
-  try { data = JSON.parse(raw); } catch { /* ignore */ }
+const CONTENT_TYPES: Record<string, string> = {
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  zip: "application/zip",
+};
 
-  for (const key of ["download_url", "file_url", "url", "href"]) {
-    if (typeof data[key] === "string" && (data[key] as string).startsWith("http"))
-      return data[key] as string;
+/**
+ * Pull a usable https URL out of a Sarvam {filename: {file_url}} map.
+ * Prefer an exact filename match; otherwise take the first entry that has a file_url.
+ */
+function pickFileUrl(map: unknown, preferredName?: string): string | undefined {
+  if (!map || typeof map !== "object") return undefined;
+  const m = map as SignedUrlMap;
+
+  if (preferredName) {
+    const exact = m[preferredName]?.file_url;
+    if (typeof exact === "string" && exact.startsWith("http")) return exact;
   }
-
-  const arr = [
-    ...(Array.isArray(data.download_details) ? data.download_details : []),
-    ...(Array.isArray(data.files)             ? data.files             : []),
-    ...(Array.isArray(data.items)             ? data.items             : []),
-  ] as Record<string, unknown>[];
-
-  for (const item of arr) {
-    for (const key of ["file_url", "download_url", "url", "href"]) {
-      if (typeof item[key] === "string" && (item[key] as string).startsWith("http"))
-        return item[key] as string;
-    }
+  for (const v of Object.values(m)) {
+    if (v && typeof v.file_url === "string" && v.file_url.startsWith("http")) return v.file_url;
   }
-
-  // Regex fallback
-  const m = raw.match(/"(?:download_url|file_url|url)"\s*:\s*"(https?:(?:[^"\\]|\\.)*)"/);
-  if (m) return m[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/");
-
   return undefined;
 }
 
@@ -134,6 +68,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
   const apiKey = context.env.SARVAM_API_KEY;
   if (!apiKey) return Response.json({ error: "SARVAM_API_KEY not configured." }, { status: 500 });
 
+  // ── Parse the uploaded image ──────────────────────────────────────────────
   let image: File | null = null;
   try {
     const form = await context.request.formData();
@@ -144,114 +79,159 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
   }
   if (!image) return Response.json({ error: "Missing or empty image field." }, { status: 400 });
 
-  const h  = { "api-subscription-key": apiKey };
-  const jh = { "Content-Type": "application/json", ...h };
-  const filename = image.name || "photo.jpg";
+  // Normalise to a clean filename + matching content type so the blob key,
+  // the PUT Content-Type, and Sarvam's `files` entry all agree.
+  const rawExt = (image.name?.split(".").pop() || "").toLowerCase();
+  const mime = (image.type || "").toLowerCase();
+  const ext = CONTENT_TYPES[rawExt]
+    ? rawExt
+    : mime.includes("png")  ? "png"
+    : mime.includes("webp") ? "webp"
+    : mime.includes("pdf")  ? "pdf"
+    : "jpg";
+  const filename = `photo.${ext}`;
+  const contentType = CONTENT_TYPES[ext];
+
+  const h  = { "api-subscription-key": apiKey };                       // GET / status calls
+  const jh = { "Content-Type": "application/json", ...h };             // JSON POST calls
 
   try {
     /* ── Step 1: Create job ───────────────────────────────────────────────── */
-    const r1  = await fetch(`${SARVAM}/doc-digitization/job/v1`, {
-      method: "POST", headers: jh,
+    const r1 = await fetch(`${SARVAM}/doc-digitization/job/v1`, {
+      method: "POST",
+      headers: jh,
       body: JSON.stringify({ job_parameters: { language: "hi-IN", output_format: "md" } }),
     });
     const t1 = await r1.text();
-    if (!r1.ok) return Response.json({ error: `Step1 failed (${r1.status}): ${t1}` }, { status: 500 });
+    if (!r1.ok) return Response.json({ error: `Step1 create-job failed (${r1.status}): ${t1}` }, { status: 502 });
 
     let d1: Record<string, unknown> = {};
     try { d1 = JSON.parse(t1); } catch {
-      return Response.json({ error: `Step1 non-JSON: ${t1}` }, { status: 500 });
+      return Response.json({ error: `Step1 non-JSON: ${t1}` }, { status: 502 });
     }
     const job_id = d1.job_id as string | undefined;
-    if (!job_id) return Response.json({ error: `No job_id in step1: ${t1}` }, { status: 500 });
+    if (!job_id) return Response.json({ error: `No job_id in step1: ${t1}` }, { status: 502 });
 
-    /* ── Step 2: Get upload URL ──────────────────────────────────────────── */
-    // Some API versions return upload_url directly in the step-1 response
-    let uploadUrl = extractUrl(t1, filename);
+    /* ── Step 2: Get presigned upload URL ─────────────────────────────────── */
+    const r2 = await fetch(`${SARVAM}/doc-digitization/job/v1/upload-files`, {
+      method: "POST",
+      headers: jh,
+      body: JSON.stringify({ job_id, files: [filename] }),
+    });
+    const t2 = await r2.text();
+    if (!r2.ok) return Response.json({ error: `Step2 upload-files failed (${r2.status}): ${t2}` }, { status: 502 });
 
-    let t2 = "";
+    let d2: { upload_urls?: SignedUrlMap } = {};
+    try { d2 = JSON.parse(t2); } catch { /* handled below */ }
+    const uploadUrl = pickFileUrl(d2.upload_urls, filename);
     if (!uploadUrl) {
-      const r2 = await fetch(`${SARVAM}/doc-digitization/job/v1/upload-files`, {
-        method: "POST", headers: jh,
-        body: JSON.stringify({ job_id, files: [filename] }),
-      });
-      t2 = await r2.text();
-      uploadUrl = extractUrl(t2, filename);
+      return Response.json({ error: `No upload URL in upload_urls map. Step2=${t2}` }, { status: 502 });
     }
 
-    if (!uploadUrl) {
-      // Surface FULL raw responses so we can see exactly what Sarvam returned
-      return Response.json({
-        error: `No upload URL found. Step1=${t1} ||| Step2=${t2}`,
-      }, { status: 500 });
-    }
-
-    /* ── Step 3: Upload image ────────────────────────────────────────────── */
+    /* ── Step 3: PUT the image to Azure blob storage ──────────────────────── */
+    // x-ms-blob-type is mandatory for the Azure_V1 backend — this was the
+    // silent failure after the upload-url field was resolved.
     const imgBuffer = await image.arrayBuffer();
     const r3 = await fetch(uploadUrl, {
-      method: "PUT", body: imgBuffer,
-      headers: { "Content-Type": image.type || "image/jpeg" },
+      method: "PUT",
+      body: imgBuffer,
+      headers: {
+        "Content-Type": contentType,
+        "x-ms-blob-type": "BlockBlob",
+      },
     });
     if (!r3.ok) {
       const t3 = await r3.text().catch(() => "");
-      return Response.json({ error: `Image PUT failed (${r3.status}): ${t3}` }, { status: 502 });
+      return Response.json({ error: `Step3 blob PUT failed (${r3.status}): ${t3}` }, { status: 502 });
     }
 
-    /* ── Step 4: Start job ───────────────────────────────────────────────── */
-    await fetch(`${SARVAM}/doc-digitization/job/v1/${job_id}/start`, {
-      method: "POST", headers: jh, body: "{}",
+    /* ── Step 4: Start the job ────────────────────────────────────────────── */
+    const r4 = await fetch(`${SARVAM}/doc-digitization/job/v1/${job_id}/start`, {
+      method: "POST",
+      headers: h,
     });
+    if (!r4.ok) {
+      const t4 = await r4.text().catch(() => "");
+      return Response.json({ error: `Step4 start failed (${r4.status}): ${t4}` }, { status: 502 });
+    }
 
-    /* ── Step 5: Poll until Completed / Failed (max ~50 s) ──────────────── */
+    /* ── Step 5: Poll status until terminal state (~48 s budget) ──────────── */
+    // States: Accepted | Pending | Running | Completed | PartiallyCompleted | Failed
     let state = "Pending";
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < 24; i++) {
       await new Promise<void>((res) => setTimeout(res, 2000));
-      const sr  = await fetch(`${SARVAM}/doc-digitization/job/v1/${job_id}/status`, { headers: h });
-      const sd  = await sr.json() as { job_state?: string };
+      const sr = await fetch(`${SARVAM}/doc-digitization/job/v1/${job_id}/status`, { headers: h });
+      const sd = await sr.json().catch(() => ({})) as { job_state?: string };
       state = sd.job_state ?? state;
       if (state === "Completed" || state === "Failed" || state === "PartiallyCompleted") break;
     }
-    if (state === "Failed") return Response.json({ error: "Sarvam OCR job failed." }, { status: 500 });
-
-    /* ── Step 6: Get download URL ────────────────────────────────────────── */
-    const r6  = await fetch(`${SARVAM}/doc-digitization/job/v1/${job_id}/download-files`, {
-      method: "POST", headers: jh, body: JSON.stringify({ job_id }),
-    });
-    const t6 = await r6.text();
-    const downloadUrl = extractDownloadUrl(t6);
-    if (!downloadUrl) {
-      return Response.json({ error: `No download URL: ${t6}` }, { status: 500 });
+    if (state === "Failed") {
+      return Response.json({ error: "Sarvam OCR job failed (job_state=Failed)." }, { status: 502 });
     }
 
-    /* ── Step 7: Download ZIP and extract text ───────────────────────────── */
+    /* ── Step 6: Get presigned download URL ───────────────────────────────── */
+    const r6 = await fetch(`${SARVAM}/doc-digitization/job/v1/${job_id}/download-files`, {
+      method: "POST",
+      headers: h,
+    });
+    const t6 = await r6.text();
+    if (!r6.ok) return Response.json({ error: `Step6 download-files failed (${r6.status}): ${t6}` }, { status: 502 });
+
+    let d6: { download_urls?: SignedUrlMap } = {};
+    try { d6 = JSON.parse(t6); } catch { /* handled below */ }
+    const downloadUrl = pickFileUrl(d6.download_urls);
+    if (!downloadUrl) {
+      return Response.json({ error: `No download URL in download_urls map (state=${state}). Step6=${t6}` }, { status: 502 });
+    }
+
+    /* ── Step 7: Download the ZIP and extract text ────────────────────────── */
     const zipRes    = await fetch(downloadUrl);
+    if (!zipRes.ok) {
+      return Response.json({ error: `Step7 ZIP download failed (${zipRes.status}).` }, { status: 502 });
+    }
     const zipBuffer = await zipRes.arrayBuffer();
     const zip       = await JSZip.loadAsync(zipBuffer);
 
     let text = "";
 
-    // Prefer Markdown output
+    // Prefer Markdown output (we requested output_format: "md").
     for (const [name, file] of Object.entries(zip.files) as [string, any][]) {
-      if (!file.dir && name.endsWith(".md")) {
+      if (!file.dir && name.toLowerCase().endsWith(".md")) {
         text = await file.async("text");
         break;
       }
     }
 
-    // Fall back to JSON
-    if (!text) {
+    // Fall back to JSON: structure is { pages: [ { blocks: [ { text } ] } ] }.
+    if (!text.trim()) {
       for (const [name, file] of Object.entries(zip.files) as [string, any][]) {
-        if (!file.dir && name.endsWith(".json")) {
+        if (!file.dir && name.toLowerCase().endsWith(".json")) {
           const rawJson = await file.async("text");
           try {
             const parsed = JSON.parse(rawJson);
-            if (Array.isArray(parsed)) {
-              text = parsed.map((p: any) => p.markdown ?? p.text ?? p.content ?? "").join("\n");
-            } else if (parsed?.pages) {
-              text = (parsed.pages as any[]).map((p: any) => p.markdown ?? p.text ?? "").join("\n");
+            if (Array.isArray(parsed?.pages)) {
+              text = (parsed.pages as any[])
+                .map((pg) =>
+                  Array.isArray(pg?.blocks)
+                    ? (pg.blocks as any[]).map((b) => b?.text ?? b?.markdown ?? "").join("\n")
+                    : (pg?.markdown ?? pg?.text ?? ""))
+                .join("\n");
+            } else if (Array.isArray(parsed)) {
+              text = parsed.map((p: any) => p?.markdown ?? p?.text ?? p?.content ?? "").join("\n");
             } else {
               text = rawJson;
             }
           } catch { text = rawJson; }
+          break;
+        }
+      }
+    }
+
+    // Last resort: any HTML output.
+    if (!text.trim()) {
+      for (const [name, file] of Object.entries(zip.files) as [string, any][]) {
+        if (!file.dir && name.toLowerCase().endsWith(".html")) {
+          text = (await file.async("text")).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
           break;
         }
       }
