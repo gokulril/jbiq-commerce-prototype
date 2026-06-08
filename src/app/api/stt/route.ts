@@ -62,10 +62,15 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
              : baseMime === "audio/ogg" ? "ogg"
              : "webm";
 
+  const languageCode = incoming.get("language_code");
+
   const sarvamForm = new FormData();
   sarvamForm.append("file", cleanAudio, `recording.${ext}`);
   sarvamForm.append("model", "saaras:v3");
   sarvamForm.append("mode", "transcribe");
+  if (languageCode && typeof languageCode === "string") {
+    sarvamForm.append("language_code", languageCode);
+  }
 
   let upstream: Response;
   try {

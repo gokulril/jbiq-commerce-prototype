@@ -200,16 +200,16 @@ function cap(s: string): string {
 
 /** Number-word → Arabic digit (covers Hindi, Hinglish, English). */
 const NUM_WORD_MAP: Record<string, string> = {
-  "एक": "1", "ek": "1", "one": "1",
-  "दो": "2", "do": "2", "two": "2",
-  "तीन": "3", "teen": "3", "three": "3",
-  "चार": "4", "char": "4", "four": "4",
-  "पाँच": "5", "paanch": "5", "five": "5",
-  "छह": "6", "chhe": "6", "six": "6",
-  "सात": "7", "saat": "7", "seven": "7",
-  "आठ": "8", "aath": "8", "eight": "8",
-  "नौ": "9", "nau": "9", "nine": "9",
-  "दस": "10", "das": "10", "ten": "10",
+  "एक": "1", "ek": "1", "one": "1", "एक": "1",
+  "दो": "2", "do": "2", "two": "2", "टू": "2",
+  "तीन": "3", "teen": "3", "three": "3", "थ्री": "3",
+  "चार": "4", "char": "4", "four": "4", "फोर": "4",
+  "पाँच": "5", "paanch": "5", "five": "5", "फाइव": "5",
+  "छह": "6", "chhe": "6", "six": "6", "सिक्स": "6",
+  "सात": "7", "saat": "7", "seven": "7", "सेवन": "7",
+  "आठ": "8", "aath": "8", "eight": "8", "एट": "8",
+  "नौ": "9", "nau": "9", "nine": "9", "नाइन": "9",
+  "दस": "10", "das": "10", "ten": "10", "टेन": "10",
   "बारह": "12", "baara": "12", "twelve": "12",
   "बीस": "20", "bees": "20", "twenty": "20",
   "आधा": "0.5", "aadha": "0.5", "half": "0.5",
@@ -435,6 +435,8 @@ const CANONICAL_TO_HI: Record<string, string> = {
   shirt: "कमीज़", tshirt: "टी-शर्ट", pant: "पैंट", socks: "मोज़े",
   shoes: "जूते", sandal: "सैंडल", chappal: "चप्पल",
   underwear: "अंडरवेयर", saree: "साड़ी", dupatta: "दुपट्टा",
+  // Cleaning
+  duster: "डस्टर", mop: "पोंछा", broom: "झाड़ू",
   // General household items
   scissors: "कैंची", pen: "पेन", pencil: "पेंसिल", paper: "कागज़",
   notebook: "नोटबुक", bag: "बैग", umbrella: "छाता",
@@ -451,7 +453,7 @@ const SYNONYMS: Record<string, string[]> = {
   atta:        ["आटा", "flour", "wheat flour", "gehun", "गेहूं"],
   onion:       ["प्याज", "pyaaz", "pyaz", "kanda"],
   potato:      ["आलू", "aloo", "aalu", "batata"],
-  tomato:      ["टमाटर", "tamatar"],
+  tomato:      ["टमाटर", "tamatar", "टोमेटोज़", "tomatoes"],
   sugar:       ["चीनी", "cheeni", "shakkar", "chini"],
   dal:         ["दाल", "lentil", "lentils", "arhar", "moong", "masoor", "chana"],
   oil:         ["तेल", "tel", "cooking oil", "sarson"],
@@ -508,6 +510,9 @@ const SYNONYMS: Record<string, string[]> = {
   bedsheet:    ["चादर", "chadar"],
   towel:       ["तौलिया", "towelia"],
   soap_dish:   ["साबुनदानी"],
+  duster:      ["डस्टर", "dust cloth", "cleaning cloth"],
+  mop:         ["पोंछा", "poncha"],
+  broom:       ["झाड़ू", "jhaadu"],
 };
 
 /* ─── Category system ─────────────────────────────────────────────────────── */
@@ -588,6 +593,7 @@ const CANONICAL_TO_CATEGORY: Record<string, Category> = {
   detergent: "household", tissues: "household",
   bucket: "household", towel: "household", bedsheet: "household",
   curtain: "household", bulb: "household", battery: "household",
+  duster: "household", mop: "household", broom: "household",
   // Clothing
   shirt: "clothing", tshirt: "clothing", pant: "clothing", socks: "clothing",
   shoes: "clothing", sandal: "clothing", chappal: "clothing",
@@ -661,9 +667,10 @@ function matchBought(boughtNames: string[], items: Item[]): Set<string> {
 
 /* ─── Sarvam API helpers ──────────────────────────────────────────────────── */
 
-async function sarvamSTT(blob: Blob): Promise<string> {
+async function sarvamSTT(blob: Blob, langCode?: string): Promise<string> {
   const form = new FormData();
   form.append("audio", blob, "recording.webm");
+  if (langCode) form.append("language_code", langCode);
   const res = await fetch("/api/stt", { method: "POST", body: form });
   if (!res.ok) {
     const { error } = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error?: string };
@@ -1501,6 +1508,7 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
   const capture = async (data?: Blob | File | string) => {
     setProcessing(true);
     const voiceFallback = lang === "hi" ? VOICE_SAMPLE_HI : VOICE_SAMPLE;
+    const langCode = lang === "hi" ? "hi-IN" : "en-IN";
 
     if (mode === "voice") {
       if (typeof data === "string") {
@@ -1510,7 +1518,7 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
       } else if (data instanceof Blob && data.size > 0) {
         /* Sarvam fallback — send audio to server */
         try {
-          const transcript = await sarvamSTT(data);
+          const transcript = await sarvamSTT(data, langCode);
           const parsed = parseItems(transcript);
           setDrafts(makeDrafts(parsed.length > 0 ? parsed : parseItems(voiceFallback)));
         } catch { setDrafts(makeDrafts(parseItems(voiceFallback))); }
@@ -1566,7 +1574,7 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
                 const displayVal = d.rawEdit !== undefined
                   ? d.rawEdit
                   : d.qty
-                    ? `${displayName(canonicalize(d.name), lang)} ${d.qty}`.trim()
+                    ? `${displayName(canonicalize(d.name), lang)} ${normalizeQty(d.qty)}`.trim()
                     : displayName(canonicalize(d.name), lang);
 
                 return (
@@ -1636,6 +1644,7 @@ function BuySheet({ t, lang, items, onClose, onConfirm }: {
   const capture = async (data?: Blob | File | string) => {
     setProcessing(true);
     const voiceFallback = lang === "hi" ? VOICE_SAMPLE_HI : VOICE_SAMPLE;
+    const langCode = lang === "hi" ? "hi-IN" : "en-IN";
 
     if (mode === "voice") {
       if (typeof data === "string") {
@@ -1645,7 +1654,7 @@ function BuySheet({ t, lang, items, onClose, onConfirm }: {
       } else if (data instanceof Blob && data.size > 0) {
         /* Sarvam fallback */
         try {
-          const transcript = await sarvamSTT(data);
+          const transcript = await sarvamSTT(data, langCode);
           const parsed = parseItems(transcript);
           applyMatch(parsed.length > 0 ? parsed.map((p) => p.name) : fallbackNames());
         } catch { applyMatch(fallbackNames()); }
