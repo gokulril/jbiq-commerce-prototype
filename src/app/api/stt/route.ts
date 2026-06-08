@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
+// Run on Cloudflare Workers (edge) — no 10-second timeout, global CDN
+export const runtime = "edge";
+
 /**
  * POST /commerce/api/stt
  *

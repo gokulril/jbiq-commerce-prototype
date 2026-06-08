@@ -1138,8 +1138,10 @@ function CapturePane({ t, lang, mode, text, setText, processing, onCapture, pict
   pictureMode: boolean;
   typeCta?: string;
 }) {
-  // ── Detect Web Speech API (Chrome Android, Safari iOS 14.1+) ──
-  const hasSR = React.useMemo(() => getSpeechRecognitionCtor() !== null, []);
+  // Sarvam STT is primary — Web Speech API disabled (unreliable on Android: silently
+  // stops after 5-6s of silence, weaker Hinglish model, no control over timeouts).
+  // Keeping the Web Speech infrastructure for future toggle if needed.
+  const hasSR = React.useMemo(() => false, []);
 
   // Web Speech state
   const wsRef      = React.useRef<ISpeechRecognition | null>(null);

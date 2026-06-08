@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import JSZip from "jszip";
 
+// Run on Cloudflare Workers (edge) — no 10-second timeout, handles long OCR jobs
+export const runtime = "edge";
+
 /**
  * POST /commerce/api/ocr
  *
