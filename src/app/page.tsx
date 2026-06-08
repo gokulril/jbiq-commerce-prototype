@@ -196,6 +196,104 @@ function cap(s: string): string {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
+/* ─── Quantity normalisation & display ────────────────────────────────────── */
+
+/** Number-word → Arabic digit (covers Hindi, Hinglish, English). */
+const NUM_WORD_MAP: Record<string, string> = {
+  "एक": "1", "ek": "1", "one": "1",
+  "दो": "2", "do": "2", "two": "2",
+  "तीन": "3", "teen": "3", "three": "3",
+  "चार": "4", "char": "4", "four": "4",
+  "पाँच": "5", "paanch": "5", "five": "5",
+  "छह": "6", "chhe": "6", "six": "6",
+  "सात": "7", "saat": "7", "seven": "7",
+  "आठ": "8", "aath": "8", "eight": "8",
+  "नौ": "9", "nau": "9", "nine": "9",
+  "दस": "10", "das": "10", "ten": "10",
+  "बारह": "12", "baara": "12", "twelve": "12",
+  "बीस": "20", "bees": "20", "twenty": "20",
+  "आधा": "0.5", "aadha": "0.5", "half": "0.5",
+  "a": "1",
+};
+
+/** Hindi unit → canonical English abbreviation. */
+const HI_UNIT_TO_EN: Record<string, string> = {
+  "किलोग्राम": "kg", "किलो": "kg",
+  "ग्राम": "g",
+  "लीटर": "L",
+  "मिली": "ml",
+  "पैकेट": "pkt",
+  "पीस": "pcs", "नग": "pcs",
+  "दर्जन": "dozen",
+  "बंडल": "bundle",
+};
+
+/**
+ * Normalise raw qty string to canonical English form stored in state.
+ * "दो किलो" → "2 kg", "teen" → "3", "1 पैकेट" → "1 pkt".
+ */
+function normalizeQty(raw: string): string {
+  if (!raw.trim()) return "";
+  let s = raw.trim();
+
+  // 1. Exact single-word number (no unit): "दो", "teen"
+  const lc = s.toLowerCase();
+  if (NUM_WORD_MAP[lc] !== undefined) return NUM_WORD_MAP[lc];
+  if (NUM_WORD_MAP[s]  !== undefined) return NUM_WORD_MAP[s];
+
+  // 2. Replace number words embedded in a longer string
+  for (const [word, digit] of Object.entries(NUM_WORD_MAP)) {
+    // word boundary for ASCII words; for Devanagari use simple replace
+    const isLatin = /^[a-z]+$/i.test(word);
+    const re = isLatin ? new RegExp(`\\b${word}\\b`, "gi") : new RegExp(word, "g");
+    s = s.replace(re, digit);
+  }
+
+  // 3. Replace Hindi unit words with English abbreviations (longest first)
+  const hiUnits = Object.keys(HI_UNIT_TO_EN).sort((a, b) => b.length - a.length);
+  for (const hiUnit of hiUnits) {
+    s = s.replace(new RegExp(hiUnit, "g"), HI_UNIT_TO_EN[hiUnit]);
+  }
+
+  // 4. Normalise common English unit aliases
+  s = s
+    .replace(/\bkilos?\b|\bkilograms?\b|\bkgs?\b/gi, "kg")
+    .replace(/\bgrams?\b|\bgms?\b/gi, "g")
+    .replace(/\blitres?\b|\bliters?\b|\bltr\b/gi, "L")
+    .replace(/\bpackets?\b|\bpkts?\b/gi, "pkt")
+    .replace(/\bpieces?\b|\bpcs?\b|\bnag\b/gi, "pcs");
+
+  return s.trim().replace(/\s+/g, " ");
+}
+
+/** Arabic digit → Devanagari digit. */
+const DIGIT_TO_DEVA: Record<string, string> = {
+  "0": "०", "1": "१", "2": "२", "3": "३", "4": "४",
+  "5": "५", "6": "६", "7": "७", "8": "८", "9": "९",
+};
+
+/** Canonical EN unit → Hindi unit label. */
+const EN_UNIT_TO_HI: Record<string, string> = {
+  "kg": "किलो", "g": "ग्राम", "L": "लीटर", "ml": "मिली",
+  "pkt": "पैकेट", "pcs": "पीस", "dozen": "दर्जन", "bundle": "बंडल",
+};
+
+/**
+ * Display qty in the selected language.
+ * EN → "2 kg" (no change); HI → "२ किलो".
+ */
+function displayQty(qty: string, lang: Lang): string {
+  if (!qty || lang !== "hi") return qty;
+  // Replace Arabic digits with Devanagari
+  let s = qty.replace(/\d/g, (d) => DIGIT_TO_DEVA[d] ?? d);
+  // Replace English unit abbreviations with Hindi (longest first to avoid partial matches)
+  const enUnits = Object.keys(EN_UNIT_TO_HI).sort((a, b) => b.length - a.length);
+  for (const u of enUnits) {
+    s = s.replace(new RegExp(`\\b${u}\\b`, "g"), EN_UNIT_TO_HI[u]);
+  }
+  return s;
+}
+
 function cleanMarkdown(raw: string): string {
   return raw
     .split("\n")
@@ -335,6 +433,7 @@ const CANONICAL_TO_HI: Record<string, string> = {
   bulb: "बल्ब", battery: "बैटरी",
   // Clothing & accessories
   shirt: "कमीज़", tshirt: "टी-शर्ट", pant: "पैंट", socks: "मोज़े",
+  shoes: "जूते", sandal: "सैंडल", chappal: "चप्पल",
   underwear: "अंडरवेयर", saree: "साड़ी", dupatta: "दुपट्टा",
   // General household items
   scissors: "कैंची", pen: "पेन", pencil: "पेंसिल", paper: "कागज़",
@@ -392,7 +491,10 @@ const SYNONYMS: Record<string, string[]> = {
   cornflakes:  ["कॉर्नफ्लेक्स"],
   // Household & clothing
   scissors:    ["कैंची", "kaichi", "sisar", "सिज़र", "scissor"],
-  shirt:       ["कमीज़", "kamiz", "कमीज"],
+  shirt:       ["कमीज़", "kamiz", "कमीज", "शर्ट"],
+  tshirt:      ["टीशर्ट", "टी-शर्ट", "t-shirt", "t shirt", "tee shirt"],
+  pant:        ["पैंट", "pants", "trouser", "trousers"],
+  shoes:       ["जूते", "जूता", "joote", "joota", "shoe", "sandal", "chappal", "चप्पल"],
   socks:       ["मोज़े", "moze", "juraab", "सॉक्स", "jurab"],
   bed:         ["बिस्तर", "bistar", "palang", "पलंग"],
   pillow:      ["तकिया", "takiya", "पिलो", "pilo"],
@@ -488,6 +590,7 @@ const CANONICAL_TO_CATEGORY: Record<string, Category> = {
   curtain: "household", bulb: "household", battery: "household",
   // Clothing
   shirt: "clothing", tshirt: "clothing", pant: "clothing", socks: "clothing",
+  shoes: "clothing", sandal: "clothing", chappal: "clothing",
   underwear: "clothing", saree: "clothing", dupatta: "clothing",
   // Other (electronics, stationery, etc.) — also the fallback
   scissors: "other", pen: "other", pencil: "other", paper: "other",
@@ -633,11 +736,11 @@ export default function HouseholdHub() {
             : d.qty ? `${d.name} ${d.qty}` : d.name;
           const parsed = parseItems(raw);
           const finalName = canonicalize(parsed[0]?.name ?? d.name);
-          const finalQty  = parsed[0]?.qty || d.qty || "";
+          const finalQty  = normalizeQty(parsed[0]?.qty || d.qty || "");
           return {
             id: `it-${Date.now()}-${i}`,
             name: finalName,
-            qty: finalQty.trim(),
+            qty: finalQty,
             bought: false,
           };
         });
@@ -900,7 +1003,7 @@ function ListItemRow({ it, lang, onToggle, bought = false }: {
           "text-body-xs font-medium text-text-disabled",
           bought && "line-through",
         )}>
-          {it.qty}
+          {displayQty(it.qty, lang)}
         </span>
       )}
     </button>
@@ -1604,7 +1707,7 @@ function BuySheet({ t, lang, items, onClose, onConfirm }: {
                     <span className={cn("flex-1 text-body-s font-medium", on ? "text-text-disabled line-through" : "text-text-high")}>
                       {displayName(it.name, lang)}
                     </span>
-                    {it.qty && <span className="text-body-xs font-medium text-text-disabled">{it.qty}</span>}
+                    {it.qty && <span className="text-body-xs font-medium text-text-disabled">{displayQty(it.qty, lang)}</span>}
                   </button>
                 );
               })}
