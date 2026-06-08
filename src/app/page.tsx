@@ -200,7 +200,7 @@ function cap(s: string): string {
 
 /** Number-word → Arabic digit (covers Hindi, Hinglish, English). */
 const NUM_WORD_MAP: Record<string, string> = {
-  "एक": "1", "ek": "1", "one": "1", "एक": "1",
+  "एक": "1", "ek": "1", "one": "1",
   "दो": "2", "do": "2", "two": "2", "टू": "2",
   "तीन": "3", "teen": "3", "three": "3", "थ्री": "3",
   "चार": "4", "char": "4", "four": "4", "फोर": "4",
