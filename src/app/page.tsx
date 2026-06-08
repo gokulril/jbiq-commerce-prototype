@@ -229,19 +229,27 @@ function parseItems(raw: string): { name: string; qty: string }[] {
       let name = part;
       let qty = "";
 
-      // Pattern 1: has NUM+UNIT anywhere (e.g. "milk 2 kg", "2 kg milk")
+      // Pattern 1: NUM+UNIT anywhere ("milk 2 kg", "2 kg milk", "do kilo aalu")
       const m = part.match(qtyRe);
       if (m) {
         qty = m[0].replace(/\s+/g, " ").trim();
         name = part.replace(m[0], " ");
       } else {
-        // Pattern 2: number-first ("2 milk", "4 onion")
+        // Pattern 2: digit-first ("2 milk", "4 onion")
         const numFirst = part.match(/^\s*(\d+(?:\.\d+)?)\s+(.+)$/);
         if (numFirst) { qty = numFirst[1]; name = numFirst[2]; }
         else {
-          // Pattern 3: number-last ("milk 2", "onions 4") — bare number after item name
+          // Pattern 3: digit-last ("milk 2", "onions 4")
           const numLast = part.match(/^(.+?)\s+(\d+(?:\.\d+)?)$/);
           if (numLast) { qty = numLast[2]; name = numLast[1]; }
+          else {
+            // Pattern 4: Hindi/English number word first, no unit ("teen pyaj", "do anda", "ek doodh")
+            // Catches spoken quantities like "teen onion" that have no kg/pkt unit
+            const numWord = part.match(
+              /^(ek|do|teen|char|paanch|chhe|saat|aath|nau|das|baara|bees|half|one|two|three|four|five|six|seven|eight|nine|ten|twelve|twenty|dozen|एक|दो|तीन|चार|पाँच|छह|सात|आठ|नौ|दस|आधा)\s+(.+)$/i,
+            );
+            if (numWord) { qty = numWord[1]; name = numWord[2]; }
+          }
         }
       }
 
@@ -1163,15 +1171,31 @@ function CapturePane({ t, lang, mode, text, setText, processing, onCapture, pict
       rec.lang = lang === "hi" ? "hi-IN" : "en-IN";
 
       rec.onresult = (e: ISpeechRecognitionEvent) => {
+        /*
+         * BUG FIX: Chrome on Android returns the ENTIRE utterance-so-far in
+         * each interim result — not just the new word. The old approach
+         * appended to wsAccumRef on every final segment AND showed
+         * (wsAccumRef + interim), which double-counted everything and
+         * produced "do Aalu do Aalu do Aalu…" garbage.
+         *
+         * Correct approach: iterate ALL results[0..length-1] on every event.
+         * Build finals[] freshly each time (no manual accumulation).
+         * The API guarantees result[i].isFinal never reverts to false.
+         * Join finals with ", " so parseItems can split them as separate items.
+         */
+        const finals: string[] = [];
         let interim = "";
-        for (let i = e.resultIndex; i < e.results.length; i++) {
+        for (let i = 0; i < e.results.length; i++) {
           if (e.results[i].isFinal) {
-            wsAccumRef.current += e.results[i][0].transcript + " ";
+            finals.push(e.results[i][0].transcript.trim());
           } else {
-            interim = e.results[i][0].transcript;
+            interim = e.results[i][0].transcript.trim();
           }
         }
-        setWsDisplay(wsAccumRef.current + interim);
+        const finalText = finals.join(", ");
+        wsAccumRef.current = finalText; // only confirmed, no interim contamination
+        // Display: finalized text + current interim word(s)
+        setWsDisplay(finalText + (interim ? (finalText ? ", " : "") + interim : ""));
       };
 
       rec.onerror = () => setMicGranted(false);
