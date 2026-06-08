@@ -1533,21 +1533,8 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
           const raw = await sarvamOCR(data);
           const parsed = parseItems(cleanMarkdown(raw));
           setDrafts(makeDrafts(parsed.length > 0 ? parsed : parseItems(SCAN_SAMPLE)));
-        } catch (e) {
-          /* DEBUG: show error as first (unticked) draft so we can diagnose */
-          const errMsg = String(e).replace(/^Error:\s*/, "").slice(0, 120);
-          setDrafts([
-            { id: "d-ocr-err", name: `⚠ OCR error: ${errMsg}`, qty: "", include: false },
-            ...makeDrafts(parseItems(SCAN_SAMPLE)),
-          ]);
-        }
-      } else {
-        /* DEBUG: file not captured */
-        setDrafts([
-          { id: "d-ocr-nofile", name: `⚠ OCR: no file (size=${data instanceof File ? (data as File).size : typeof data})`, qty: "", include: false },
-          ...makeDrafts(parseItems(SCAN_SAMPLE)),
-        ]);
-      }
+        } catch { setDrafts(makeDrafts(parseItems(SCAN_SAMPLE))); }
+      } else { setDrafts(makeDrafts(parseItems(SCAN_SAMPLE))); }
       setProcessing(false); setStage("confirm");
 
     } else {
