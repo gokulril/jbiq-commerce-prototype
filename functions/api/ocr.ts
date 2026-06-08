@@ -53,26 +53,44 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       const detail = await createRes.text().catch(() => "");
       return Response.json({ error: "Create job failed.", detail }, { status: createRes.status });
     }
-    const { job_id } = await createRes.json() as { job_id: string };
+    const createRaw = await createRes.text();
+    let createData: Record<string, unknown> = {};
+    try { createData = JSON.parse(createRaw); } catch { /* ignore */ }
+    const job_id = createData.job_id as string;
+    if (!job_id) {
+      return Response.json({ error: `No job_id. Step1: ${createRaw.slice(0, 200)}` }, { status: 500 });
+    }
 
     /* ── Step 2: Get pre-signed upload URL ── */
-    const uploadUrlRes = await fetch(`${SARVAM}/doc-digitization/job/v1/upload-files`, {
-      method: "POST",
-      headers: jsonHeaders,
-      body: JSON.stringify({ job_id, files: [filename] }),
-    });
-    if (!uploadUrlRes.ok) {
-      const detail = await uploadUrlRes.text().catch(() => "");
-      return Response.json({ error: `Upload-URL step ${uploadUrlRes.status}: ${detail.slice(0, 200)}` }, { status: 500 });
-    }
-    const uploadData = await uploadUrlRes.json() as Record<string, unknown>;
-    /* Sarvam v1 returned upload_details[0].file_url; current API returns upload_url at top level */
-    const details = (uploadData?.upload_details ?? uploadData?.files ?? []) as { file_url?: string; upload_url?: string }[];
-    const uploadUrl = (uploadData?.upload_url as string | undefined)
-      ?? details[0]?.file_url
-      ?? details[0]?.upload_url;
+    /* Sarvam may return upload_url in step 1 (newer API) or in a separate upload-files call */
+    let uploadUrl = createData.upload_url as string | undefined;
+
     if (!uploadUrl) {
-      return Response.json({ error: `No upload URL. Sarvam said: ${JSON.stringify(uploadData).slice(0, 250)}` }, { status: 500 });
+      const uploadUrlRes = await fetch(`${SARVAM}/doc-digitization/job/v1/upload-files`, {
+        method: "POST",
+        headers: jsonHeaders,
+        body: JSON.stringify({ job_id, files: [filename] }),
+      });
+      const uploadRaw = await uploadUrlRes.text();
+      if (!uploadUrlRes.ok) {
+        return Response.json({ error: `Upload-URL step ${uploadUrlRes.status}: ${uploadRaw.slice(0, 200)}` }, { status: 500 });
+      }
+      let uploadData: Record<string, unknown> = {};
+      try { uploadData = JSON.parse(uploadRaw); } catch { /* ignore */ }
+      const details = (uploadData?.upload_details ?? uploadData?.files ?? []) as { file_url?: string; upload_url?: string }[];
+      uploadUrl = (uploadData?.upload_url as string | undefined)
+        ?? details[0]?.file_url
+        ?? details[0]?.upload_url;
+
+      /* Regex fallback — catches the URL even if JSON parse drops it */
+      if (!uploadUrl) {
+        const m = uploadRaw.match(/"upload_url"\s*:\s*"(https?:[^"]+)"/);
+        if (m) uploadUrl = m[1].replace(/\\u0026/g, "&");
+      }
+
+      if (!uploadUrl) {
+        return Response.json({ error: `No upload URL. Step1: ${createRaw.slice(0, 100)} Step2: ${uploadRaw.slice(0, 200)}` }, { status: 500 });
+      }
     }
 
     /* ── Step 3: Upload image ── */
