@@ -294,46 +294,6 @@ function displayQty(qty: string, lang: Lang): string {
   return s;
 }
 
-/**
- * Lines that are clearly notes / reminders / to-dos, not shopping items.
- * Handles the common case of a grocery list sharing a page with other jottings:
- * arrow bullets (→ ➜ » or ascii "->"), tick/cross marks (✓ ✗), blockquote ">"
- * markers (OCR often renders a handwritten arrow as ">"), and a tight set of note
- * keywords. Kept deliberately narrow so real items — including Latin-script brand
- * names like "Tata Salt" — are never dropped.
- */
-function looksLikeNote(line: string): boolean {
-  const l = line.trim();
-  if (!l) return true;
-  if (/[→➜➔➤»]/.test(l)) return true;        // unicode arrows
-  if (/(^|\s)-+>/.test(l)) return true;        // ascii arrow "->"
-  if (/[✓✔✗✘☑✅❌]/.test(l)) return true;      // tick / cross marks
-  if (/^>+\s/.test(l)) return true;            // OCR'd arrow rendered as blockquote ">"
-  if (/\b(mail|e-?mail|call|meeting|reminder|to-?do)\b/i.test(l)) return true;
-  return false;
-}
-
-function cleanMarkdown(raw: string): string {
-  return raw
-    .split("\n")
-    .map((line) => {
-      if (looksLikeNote(line)) return "";        // drop reminders / to-do jottings
-      const stripped = line.replace(/[\s|:*_-]/g, "");
-      if (!stripped) return "";
-      line = line.replace(/^#+\s*/, "");
-      if (line.includes("|")) {
-        const cells = line.split("|").map((c) => c.trim()).filter((c) => c && !/^[-:\s]+$/.test(c));
-        if (cells.length > 0) line = cells.join(" ");
-      }
-      line = line.replace(/^\s*[\d१२३४५६७८९०]+[.)]\s+/, "");
-      line = line.replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1");
-      line = line.replace(/^\s*[-•*]\s*/, "");
-      return line.trim();
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
 function parseItems(raw: string): { name: string; qty: string }[] {
   if (!raw.trim()) return [];
   const normalised = normalizeDigits(raw);
@@ -382,8 +342,6 @@ function parseItems(raw: string): { name: string; qty: string }[] {
 
 const VOICE_SAMPLE    = "milk, 3 kg rice, 1 packet salt";
 const VOICE_SAMPLE_HI = "दूध, 3 किलो चावल, 1 पैकेट नमक";
-const SCAN_SAMPLE     = "Aashirvaad Atta 5 kg\nOnion 1 kg\nTata Salt 1 pkt\nAmul Milk 1 l";
-
 function recognize(typed: string): { name: string; qty: string }[] {
   return parseItems(typed);
 }
@@ -700,7 +658,13 @@ async function sarvamSTT(blob: Blob, langCode?: string): Promise<string> {
   return transcript ?? "";
 }
 
-async function sarvamOCR(file: File): Promise<string> {
+/**
+ * Scan a photo of a list via Claude vision (/api/ocr) → structured items.
+ * Claude reads the handwriting, drops unrelated notes, translates and normalises
+ * quantities server-side. Returns parser-shaped { name, qty } pairs; an empty
+ * array means the image couldn't be read (caller should ask for a retake).
+ */
+async function scanImage(file: File): Promise<{ name: string; qty: string }[]> {
   const form = new FormData();
   form.append("image", file, file.name || "photo.jpg");
   const res = await fetch("/api/ocr", { method: "POST", body: form });
@@ -708,8 +672,16 @@ async function sarvamOCR(file: File): Promise<string> {
     const { error } = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error?: string };
     throw new Error(error ?? `HTTP ${res.status}`);
   }
-  const { text } = await res.json() as { text?: string };
-  return text ?? "";
+  const { items } = await res.json() as {
+    items?: { name_en?: string; name_hi?: string; qty?: string; unit?: string }[];
+  };
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((it) => it && (it.name_en ?? "").trim())
+    .map((it) => ({
+      name: cap((it.name_en ?? "").trim()),
+      qty: [String(it.qty ?? "").trim(), String(it.unit ?? "").trim()].filter(Boolean).join(" "),
+    }));
 }
 
 /* ─── Root ────────────────────────────────────────────────────────────────── */
@@ -1512,6 +1484,7 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
   const [text,       setText]       = React.useState("");
   const [processing, setProcessing] = React.useState(false);
   const [drafts,     setDrafts]     = React.useState<Draft[]>([]);
+  const [scanError,  setScanError]  = React.useState(false);
 
   const makeDrafts = (parsed: { name: string; qty: string }[]) =>
     parsed.map((p, i) => ({ id: `d-${Date.now()}-${i}`, name: p.name, qty: p.qty, include: true }));
@@ -1550,11 +1523,12 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
     } else if (mode === "scan") {
       if (data instanceof File && data.size > 0) {
         try {
-          const raw = await sarvamOCR(data);
-          const parsed = parseItems(cleanMarkdown(raw));
-          setDrafts(makeDrafts(parsed.length > 0 ? parsed : parseItems(SCAN_SAMPLE)));
-        } catch { setDrafts(makeDrafts(parseItems(SCAN_SAMPLE))); }
-      } else { setDrafts(makeDrafts(parseItems(SCAN_SAMPLE))); }
+          const parsed = await scanImage(data);
+          if (parsed.length === 0) { setScanError(true); setProcessing(false); return; }
+          setScanError(false);
+          setDrafts(makeDrafts(parsed));
+        } catch { setScanError(true); setProcessing(false); return; }
+      } else { setScanError(true); setProcessing(false); return; }
       setProcessing(false); setStage("confirm");
 
     } else {
@@ -1575,6 +1549,13 @@ function AddSheet({ t, lang, initialMode, onClose, onConfirm }: {
             <ModeChips t={t} mode={mode} setMode={setMode} scanLabel={t.modeScan} />
             <CapturePane t={t} lang={lang} mode={mode} text={text} setText={setText}
               processing={processing} onCapture={capture} pictureMode={false} />
+            {scanError && mode === "scan" && (
+              <p className="text-center text-body-xs font-medium text-red-600">
+                {lang === "hi"
+                  ? "सूची साफ़ नहीं पढ़ी जा सकी। कृपया सूची को पूरे फ़्रेम में, अच्छी रोशनी में रखकर दोबारा फ़ोटो लें।"
+                  : "Couldn't read the list clearly. Retake with the list filling the frame, in good light."}
+              </p>
+            )}
           </>
         ) : (
           <>
@@ -1686,8 +1667,7 @@ function BuySheet({ t, lang, items, onClose, onConfirm }: {
     } else if (mode === "scan") {
       if (data instanceof File && data.size > 0) {
         try {
-          const raw = await sarvamOCR(data);
-          const parsed = parseItems(cleanMarkdown(raw));
+          const parsed = await scanImage(data);
           applyMatch(parsed.length > 0 ? parsed.map((p) => p.name) : fallbackNames());
         } catch { applyMatch(fallbackNames()); }
       } else { applyMatch(fallbackNames()); }
