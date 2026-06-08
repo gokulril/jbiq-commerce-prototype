@@ -61,12 +61,16 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       headers: jsonHeaders,
       body: JSON.stringify({ job_id, files: [filename] }),
     });
-    const uploadData = await uploadUrlRes.json() as {
-      upload_details?: { file_url: string }[];
-    };
-    const uploadUrl = uploadData?.upload_details?.[0]?.file_url;
+    if (!uploadUrlRes.ok) {
+      const detail = await uploadUrlRes.text().catch(() => "");
+      return Response.json({ error: `Upload-URL step ${uploadUrlRes.status}: ${detail.slice(0, 200)}` }, { status: 500 });
+    }
+    const uploadData = await uploadUrlRes.json() as Record<string, unknown>;
+    /* Try multiple field names Sarvam may use */
+    const details = (uploadData?.upload_details ?? uploadData?.files ?? []) as { file_url?: string; upload_url?: string }[];
+    const uploadUrl = details[0]?.file_url ?? details[0]?.upload_url;
     if (!uploadUrl) {
-      return Response.json({ error: "No upload URL returned." }, { status: 500 });
+      return Response.json({ error: `No upload URL. Sarvam said: ${JSON.stringify(uploadData).slice(0, 250)}` }, { status: 500 });
     }
 
     /* ── Step 3: Upload image ── */
